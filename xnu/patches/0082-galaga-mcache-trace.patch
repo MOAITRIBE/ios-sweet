@@ -1,0 +1,38 @@
+--- a/bsd/kern/mcache.c	2026-10-23 17:36:14
++++ b/bsd/kern/mcache.c	2026-10-23 17:36:25
+@@ -183,8 +183,11 @@
+ 
+ 	VERIFY(mca_trn_max >= 2);
+ 
++	kprintf("GALAGA MC: wait max cpus\n");
+ 	ncpu = ml_wait_max_cpus();
++	kprintf("GALAGA MC: ncpu=%u, cache line\n", ncpu);
+ 	(void) mcache_cache_line_size();        /* prime it */
++	kprintf("GALAGA MC: line=%u, thread calls\n", cache_line_size);
+ 
+ 	mcache_reap_tcall = thread_call_allocate(mcache_reap_timeout, NULL);
+ 	mcache_update_tcall = thread_call_allocate(mcache_update, NULL);
+@@ -194,6 +197,7 @@
+ 		__builtin_unreachable();
+ 	}
+ 
++	kprintf("GALAGA MC: zone\n");
+ 	mcache_zone = zone_create("mcache", MCACHE_ALLOC_SIZE,
+ 	    ZC_PGZ_USE_GUARDS | ZC_DESTRUCTIBLE);
+ 
+@@ -203,6 +207,7 @@
+ 		btp = &mcache_bkttype[i];
+ 		(void) snprintf(name, sizeof(name), "bkt_%d",
+ 		    btp->bt_bktsize);
++		kprintf("GALAGA MC: create %s\n", name);
+ 		btp->bt_cache = mcache_create(name,
+ 		    (btp->bt_bktsize + 1) * sizeof(void *), 0, 0, MCR_SLEEP);
+ 	}
+@@ -213,6 +218,7 @@
+ 	mcache_audit_cache = mcache_create("audit", sizeof(mcache_audit_t),
+ 	    0, 0, MCR_SLEEP);
+ 
++	kprintf("GALAGA MC: enable buckets\n");
+ 	mcache_applyall(mcache_cache_bkt_enable);
+ 	mcache_ready = 1;
+ 

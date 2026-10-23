@@ -1,5 +1,5 @@
 --- a/bsd/kern/mcache.c	2026-10-23 17:36:14
-+++ b/bsd/kern/mcache.c	2026-10-23 17:36:25
++++ b/bsd/kern/mcache.c	2026-10-23 17:51:28
 @@ -183,8 +183,11 @@
  
  	VERIFY(mca_trn_max >= 2);
@@ -36,3 +36,32 @@
  	mcache_applyall(mcache_cache_bkt_enable);
  	mcache_ready = 1;
  
+@@ -287,7 +293,9 @@
+ 	unsigned int c;
+ 	char lck_name[64];
+ 
++	kprintf("GALAGA MC:  %s zalloc (alloc size %lu, line %u)\n", name, (unsigned long)MCACHE_ALLOC_SIZE, CPU_CACHE_LINE_SIZE);
+ 	buf = zalloc_flags(mcache_zone, Z_WAITOK | Z_ZERO | Z_NOFAIL);
++	kprintf("GALAGA MC:  %s buf %p\n", name, buf);
+ 
+ 	/*
+ 	 * In case we didn't get a cache-aligned memory, round it up
+@@ -348,8 +356,10 @@
+ 		VERIFY(align != 0 && (align % MCACHE_ALIGN) == 0);
+ 		chunksize += sizeof(uint64_t) + align;
+ 		chunksize = P2ROUNDUP(chunksize, align);
++		kprintf("GALAGA MC:  %s zone_create %lu\n", name, (unsigned long)chunksize);
+ 		cp->mc_slab_zone = zone_create(cp->mc_name, chunksize,
+ 		    ZC_PGZ_USE_GUARDS | ZC_DESTRUCTIBLE);
++		kprintf("GALAGA MC:  %s zone ok\n", name);
+ 	}
+ 	cp->mc_chunksize = chunksize;
+ 
+@@ -371,6 +381,7 @@
+ 	}
+ 
+ 	cp->cache_bkttype = btp;
++	kprintf("GALAGA MC:  %s cpu layer x%u\n", name, ncpu);
+ 
+ 	/*
+ 	 * Initialize the CPU layer.  Each per-CPU structure is aligned

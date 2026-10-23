@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_ufs.c	2026-10-23 18:09:25
-+++ b/bsd/dev/sweet_ufs.c	2026-10-23 19:14:16
-@@ -351,12 +351,125 @@
++++ b/bsd/dev/sweet_ufs.c	2026-10-23 19:48:26
+@@ -351,12 +351,156 @@
  	}
  	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
  	return ENOENT;
@@ -26,7 +26,29 @@
 +#define MTK_REFCLK_CTRL     0x144
 +#define MTK_SIP_UFS_CONTROL 0xc2000276u         /* MTK_SIP_SMC_CMD(0x276), SMC64 */
 +#define MTK_SIP_REF_CLK     (1u << 3)           /* UFS_MTK_SIP_REF_CLK_NOTIFICATION */
++#define MTK_SIP_DEV_RESET   (1u << 1)           /* UFS_MTK_SIP_DEVICE_RESET */
++#define MTK_UFSPHY_PA       0x112a0000u         /* ufsphy@112a0000 (mediatek,mt8183-ufsphy) */
 +
++static int galaga_link_err = -1;
++static uint32_t galaga_refclk;
++
++/* drivers/phy/mediatek/phy-mtk-ufs.c ufs_mtk_phy_set_active() */
++static void
++mtk_ufsphy_set_active(void)
++{
++	volatile uint32_t *phy = (volatile uint32_t *)ml_io_map(MTK_UFSPHY_PA, 0x10000);
++	volatile uint32_t *glb = phy + 0x008c / 4, *rx44 = phy + 0xb044 / 4;
++	volatile uint32_t *rxac = phy + 0xa0ac / 4, *rx9c = phy + 0xa09c / 4;
++
++	*glb = (*glb | (1u << 11)) & ~(1u << 10);              /* PLL_PWR_ON, release FRC */
++	*glb &= ~((1u << 9) | (1u << 8));                       /* PLL_ISO_EN, FRC_PLL_ISO_EN */
++	*rx44 = (*rx44 | (1u << 18)) & ~(1u << 17);             /* CDR_PWR_ON, release FRC */
++	*rx44 &= ~((1u << 20) | (1u << 19));                    /* CDR_ISO_EN, FRC_CDR_ISO_EN */
++	*rxac = (*rxac | (1u << 1)) & ~(1u << 0);               /* RX_SQ_EN, release FRC */
++	delay(1);
++	*rx9c &= ~(1u << 18);                                   /* release FSM_DIFZ_FRC */
+ }
+ 
 +static void
 +mtk_sip_ufs(uint64_t op, uint64_t a1, uint64_t a2)
 +{
@@ -38,7 +60,7 @@
 +	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
 +}
 +
-+static int
+ static int
 +ufs_uic(uint32_t cmd, uint32_t arg1, uint32_t arg3, uint32_t *out)
 +{
 +	for (int i = 0; i < 1000 && !(ufs_rd(REG_HCS) & HCS_UCRDY); i++) {
@@ -78,11 +100,19 @@
 +		delay(10);
 +	}
 +	mtk_sip_ufs(MTK_SIP_REF_CLK, 1, 1);                    /* POST_CHANGE */
++	galaga_refclk = ufs_rd(MTK_REFCLK_CTRL);
 +	delay(100);
-+	ufs_wr(MTK_XOUFS_CTRL, ufs_rd(MTK_XOUFS_CTRL) | 0x80); /* CLK_CG early */
++	mtk_ufsphy_set_active();
 +
++	/* ufs_mtk_device_reset(): host stopped, RST_n low >= 10 us, then high and wait */
 +	ufs_wr(REG_HCE, 0);
 +	delay(1000);
++	mtk_sip_ufs(MTK_SIP_DEV_RESET, 0, 0);
++	delay(15);
++	mtk_sip_ufs(MTK_SIP_DEV_RESET, 1, 0);
++	delay(15000);
++
++	ufs_wr(MTK_XOUFS_CTRL, ufs_rd(MTK_XOUFS_CTRL) | 0x80); /* CLK_CG early */
 +	ufs_wr(REG_HCE, 1);
 +	for (int i = 0; i < 1000 && !(ufs_rd(REG_HCE) & 1); i++) {
 +		delay(10);
@@ -101,6 +131,7 @@
 +
 +	for (int tries = 0; tries < 4; tries++) {
 +		err = ufs_uic(UIC_DME_LINKSTARTUP, 0, 0, NULL);
++		galaga_link_err = err;
 +		delay(1000);
 +		printf("GALAGA UFS: link startup %d -> %d, hcs 0x%x\n", tries, err, ufs_rd(REG_HCS));
 +		if (!err && (ufs_rd(REG_HCS) & HCS_DP)) {
@@ -108,9 +139,9 @@
 +		}
 +	}
 +	return ENXIO;
- }
- 
- static int
++}
++
++static int
  ufs_take_over_host(void)
  {
  	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
@@ -126,7 +157,7 @@
  	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
  		printf("SWEET UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
  		return ENXIO;
-@@ -620,20 +733,39 @@
+@@ -620,20 +764,41 @@
  	su.dma_pa = ptoa_64(pn);
  	su.lun = 0;
  	su.secsize = DEV_BSIZE;
@@ -166,8 +197,10 @@
 +		/* Galaga bring-up: keep the reason on screen before the root panic replaces it. */
 +		/* Galaga bring-up: put the host state into the panic string, which stays on screen. */
 +		if (su.regs) {
-+			panic("GALAGA UFS: init failed %d lun %u cap 0x%x hce 0x%x hcs 0x%x dbr 0x%x dma 0x%llx",
-+			    error, su.lun, ufs_rd(REG_CAP), ufs_rd(REG_HCE), ufs_rd(REG_HCS), ufs_rd(REG_UTRLDBR), su.dma_pa);
++			panic("GALAGA UFS: init failed %d lun %u cap 0x%x hce 0x%x hcs 0x%x dbr 0x%x dma 0x%llx "
++			    "link %d refclk 0x%x is 0x%x uecpa 0x%x uecdl 0x%x",
++			    error, su.lun, ufs_rd(REG_CAP), ufs_rd(REG_HCE), ufs_rd(REG_HCS), ufs_rd(REG_UTRLDBR), su.dma_pa,
++			    galaga_link_err, galaga_refclk, ufs_rd(REG_IS), ufs_rd(0x38), ufs_rd(0x3c));
 +		}
  		return error;
  	}

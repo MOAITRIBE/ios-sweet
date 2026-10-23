@@ -9,9 +9,11 @@ Galaga's hardware from the live FDT our milestone-0 shim dumped (HARDWARE_MAP.md
 - GICv3: GICD 0x0c000000 (0x40000), GICR 0x0c040000 (0x200000).
 - Generic timer: 13 MHz; virtual timer PPI 11 = INTID 27.
 - Framebuffer: LK's videolfb at 0xfe0d0000, 1080x2392, 4352 bytes per line.
-- No /sweet-ufs node: sweet's UFS driver and persistent log stay off until UFS is ported.
+- UFS: the MediaTek UFSHCI at 0x112b0000 (0x2300) LK leaves running; same JEDEC register
+  set as sweet's Qualcomm host. Patch 0083 finds the LU with the userdata GPT (LU 2 here).
+  The driver stays read-only unless boot-arg ufsrw=1. --no-ufs leaves the node out.
 
-usage: mkadt_galaga.py OUT.adt [--dump]
+usage: mkadt_galaga.py OUT.adt [--dump] [--no-ufs]
 """
 import os
 import sys
@@ -29,12 +31,17 @@ mkadt.VTIMER_INTID = 27
 mkadt.FB, mkadt.FB_SIZE = 0xfe0d0000, 0x1df0000
 mkadt.FB_W, mkadt.FB_H, mkadt.FB_STRIDE = 1080, 2392, 1088 * 4
 mkadt.SWEET_ECID = 0x47414c4147410001  # 'GALAGA' + 1, synthetic
+mkadt.UFS, mkadt.UFS_SIZE = 0x112b0000, 0x2300
 
 
-def build():
+def build(ufs=True):
     root = mkadt.build(highmem=True)
     name = lambda n: dict((k, v) for k, f, v in n.props).get('name', b'').rstrip(b'\0').decode()
-    root.children = [c for c in root.children if name(c) != 'sweet-ufs']
+    if not ufs:
+        root.children = [c for c in root.children if name(c) != 'sweet-ufs']
+    for c in root.children:
+        if name(c) == 'sweet-ufs':
+            c.props = [(k, f, b'mediatek,mt8183-ufshci\0' if k == 'compatible' else v) for k, f, v in c.props]
     for k, (key, flags, val) in enumerate(root.props):
         if key == 'compatible':
             # keep D22AP/iPhone10,3 for the userland and xiaomi,sweet for SweetPlatformExpert
@@ -48,7 +55,7 @@ def build():
 
 
 if __name__ == '__main__':
-    root = build()
+    root = build(ufs='--no-ufs' not in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

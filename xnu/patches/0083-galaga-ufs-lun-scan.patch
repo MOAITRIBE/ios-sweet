@@ -1,0 +1,40 @@
+--- a/bsd/dev/sweet_ufs.c	2026-10-23 18:09:25
++++ b/bsd/dev/sweet_ufs.c	2026-10-23 18:09:25
+@@ -620,18 +620,31 @@
+ 	su.dma_pa = ptoa_64(pn);
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
++	uint32_t only_lun = 8;                  /* boot-arg ufslun=N: look at LU N only */
++	PE_parse_boot_argn("ufslun", &only_lun, sizeof(only_lun));
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+-		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		/*
++		 * Galaga (MediaTek): LU 0/1 hold the boot areas and the main GPT
++		 * (userdata) is normally on LU 2, so try each LU until one has it.
++		 */
++		uint32_t first = only_lun < 8 ? only_lun : 0, end = only_lun < 8 ? only_lun + 1 : 8;
++		int found = ENOENT;
++		for (uint32_t lun = first; lun < end && found; lun++) {
++			static const uint8_t tur[6] = { 0x00 };
++			su.lun = (uint8_t)lun;
++			/* The first command after the bootloader may report a unit attention. */
++			for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			}
++			printf("GALAGA UFS: LUN %u test-unit-ready -> %d\n", lun, error);
++			if (!error) {
++				found = ufs_find_partition(want);
++			}
+ 		}
++		error = found;
+ 	}
+-	if (!error) {
+-		error = ufs_find_partition(want);
+-	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;

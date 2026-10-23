@@ -1,6 +1,132 @@
 --- a/bsd/dev/sweet_ufs.c	2026-10-23 18:09:25
-+++ b/bsd/dev/sweet_ufs.c	2026-10-23 18:52:02
-@@ -620,20 +620,39 @@
++++ b/bsd/dev/sweet_ufs.c	2026-10-23 19:14:16
+@@ -351,12 +351,125 @@
+ 	}
+ 	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+ 	return ENOENT;
++}
++
++/*
++ * Galaga (MediaTek MT6878): LK switches the UFS host off before it jumps to us
++ * (HCE 0, HCS 0), unlike sweet's ABL. Bring it back up the way Linux's
++ * ufs-mediatek.c + ufshcd.c do: reference clock request (with the SiP
++ * notification), CLK_CG early, HCE, MediaTek pre-link UniPro settings, then
++ * DME_LINKSTARTUP until the device is present. No data is read or written here.
++ */
++#define REG_UICCMD          0x90
++#define REG_UICCMDARG1      0x94
++#define REG_UICCMDARG2      0x98
++#define REG_UICCMDARG3      0x9c
++#define IS_UCCS             (1u << 10)
++#define HCS_UCRDY           (1u << 3)
++#define UIC_DME_GET         0x01
++#define UIC_DME_SET         0x02
++#define UIC_DME_LINKSTARTUP 0x16
++#define MTK_XOUFS_CTRL      0x140
++#define MTK_REFCLK_CTRL     0x144
++#define MTK_SIP_UFS_CONTROL 0xc2000276u         /* MTK_SIP_SMC_CMD(0x276), SMC64 */
++#define MTK_SIP_REF_CLK     (1u << 3)           /* UFS_MTK_SIP_REF_CLK_NOTIFICATION */
++
++static void
++mtk_sip_ufs(uint64_t op, uint64_t a1, uint64_t a2)
++{
++	register uint64_t x0 __asm__("x0") = MTK_SIP_UFS_CONTROL;
++	register uint64_t x1 __asm__("x1") = op;
++	register uint64_t x2 __asm__("x2") = a1;
++	register uint64_t x3 __asm__("x3") = a2;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "x4", "x5", "x6", "x7",
++	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++}
++
++static int
++ufs_uic(uint32_t cmd, uint32_t arg1, uint32_t arg3, uint32_t *out)
++{
++	for (int i = 0; i < 1000 && !(ufs_rd(REG_HCS) & HCS_UCRDY); i++) {
++		delay(10);
++	}
++	if (!(ufs_rd(REG_HCS) & HCS_UCRDY)) {
++		return ETIMEDOUT;
++	}
++	ufs_wr(REG_IS, IS_UCCS);
++	ufs_wr(REG_UICCMDARG1, arg1);
++	ufs_wr(REG_UICCMDARG2, 0);
++	ufs_wr(REG_UICCMDARG3, arg3);
++	ufs_wr(REG_UICCMD, cmd);
++	for (int i = 0; i < 50000 && !(ufs_rd(REG_IS) & IS_UCCS); i++) {
++		delay(10);
++	}
++	if (!(ufs_rd(REG_IS) & IS_UCCS)) {
++		return ETIMEDOUT;
++	}
++	ufs_wr(REG_IS, IS_UCCS);
++	uint32_t rc = ufs_rd(REG_UICCMDARG2) & 0xff;
++	if (out) {
++		*out = ufs_rd(REG_UICCMDARG3);
++	}
++	return rc ? EIO : 0;
++}
++
++static int
++ufs_galaga_bringup(void)
++{
++	uint32_t v = 0;
++	int err;
++
++	mtk_sip_ufs(MTK_SIP_REF_CLK, 1, 0);                    /* PRE_CHANGE */
++	ufs_wr(MTK_REFCLK_CTRL, 1);                             /* REFCLK_REQUEST */
++	for (int i = 0; i < 300 && ((ufs_rd(MTK_REFCLK_CTRL) >> 1) & 1) != 1; i++) {
++		delay(10);
++	}
++	mtk_sip_ufs(MTK_SIP_REF_CLK, 1, 1);                    /* POST_CHANGE */
++	delay(100);
++	ufs_wr(MTK_XOUFS_CTRL, ufs_rd(MTK_XOUFS_CTRL) | 0x80); /* CLK_CG early */
++
++	ufs_wr(REG_HCE, 0);
++	delay(1000);
++	ufs_wr(REG_HCE, 1);
++	for (int i = 0; i < 1000 && !(ufs_rd(REG_HCE) & 1); i++) {
++		delay(10);
++	}
++	printf("GALAGA UFS: refclk 0x%x hce 0x%x hcs 0x%x\n", ufs_rd(MTK_REFCLK_CTRL), ufs_rd(REG_HCE), ufs_rd(REG_HCS));
++	if (!(ufs_rd(REG_HCE) & 1)) {
++		return ENXIO;
++	}
++
++	/* ufs_mtk_pre_link: UniPro out of LPM, host TX LCC off, no deep stall */
++	(void)ufs_uic(UIC_DME_SET, 0xd0a8u << 16, 0, NULL);    /* VS_UNIPROPOWERDOWNCONTROL = 0 */
++	(void)ufs_uic(UIC_DME_SET, 0x155eu << 16, 0, NULL);    /* PA_Local_TX_LCC_Enable = 0 */
++	if (!ufs_uic(UIC_DME_GET, 0xd0a6u << 16, 0, &v)) {      /* VS_SAVEPOWERCONTROL */
++		(void)ufs_uic(UIC_DME_SET, 0xd0a6u << 16, v & ~(1u << 6), NULL);
++	}
++
++	for (int tries = 0; tries < 4; tries++) {
++		err = ufs_uic(UIC_DME_LINKSTARTUP, 0, 0, NULL);
++		delay(1000);
++		printf("GALAGA UFS: link startup %d -> %d, hcs 0x%x\n", tries, err, ufs_rd(REG_HCS));
++		if (!err && (ufs_rd(REG_HCS) & HCS_DP)) {
++			return 0;
++		}
++	}
++	return ENXIO;
+ }
+ 
+ static int
+ ufs_take_over_host(void)
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
++	if (!(hce & 1) || !(hcs & HCS_DP)) {
++		printf("GALAGA UFS: host off after LK (hce 0x%x hcs 0x%x), bringing it up\n", hce, hcs);
++		int err = ufs_galaga_bringup();
++		if (err) {
++			return err;
++		}
++		hce = ufs_rd(REG_HCE);
++		hcs = ufs_rd(REG_HCS);
++	}
+ 	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
+ 		printf("SWEET UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
+ 		return ENXIO;
+@@ -620,20 +733,39 @@
  	su.dma_pa = ptoa_64(pn);
  	su.lun = 0;
  	su.secsize = DEV_BSIZE;

@@ -19,6 +19,7 @@ os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${
 
 work=$(mktemp -d /private/tmp/iosroot.XXXXXX)
 devs=()
+done_ok=0
 cleanup() {
 	for m in "$work"/root "$work"/os "$work"/sysos "$work"/appos; do
 		mount | grep -q " on $m " && umount "$m" 2>/dev/null || true
@@ -27,6 +28,11 @@ cleanup() {
 		hdiutil detach -quiet "$d" 2>/dev/null || true
 	done
 	rmdir "$work"/* "$work" 2>/dev/null || true
+	# a half-built image is useless: remove it so the next run can start clean
+	if [[ $done_ok == 0 && -n ${made_out:-} ]]; then
+		rm -f "$out"
+		echo "failed: removed the partial $out" >&2
+	fi
 }
 trap cleanup EXIT
 
@@ -45,12 +51,20 @@ attach_ro "$appos" appos raw
 
 # Target: sparse raw file -> one case-sensitive journaled HFS+ volume.
 mkfile -n "$size" "$out"
+made_out=1
 tdev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$out" | awk 'NR==1{print $1}')
 devs=("$tdev" "${devs[@]}")
 newfs_hfs -s -J -v iOSRoot "$tdev"
 mkdir "$work/root"
+# mount(8) as root keeps owners (diskutil enableOwnership only works on diskutil's own
+# mounts); prove it before copying 10 GB of root/mobile/_logd-owned files.
 mount -t hfs "$tdev" "$work/root"
-diskutil enableOwnership "$work/root" >/dev/null
+touch "$work/root/.owner-test" && chown 272:272 "$work/root/.owner-test"
+if [[ $(stat -f %u:%g "$work/root/.owner-test") != 272:272 ]]; then
+	echo "the HFS+ volume ignores file owners; refusing to build a broken root" >&2
+	exit 1
+fi
+rm -f "$work/root/.owner-test"
 # Keep Spotlight and fseventsd from writing their files into the iOS root.
 touch "$work/root/.metadata_never_index"
 mdutil -i off "$work/root" >/dev/null 2>&1 || true
@@ -112,4 +126,5 @@ df -h "$work/root"
 umount "$work/root"
 fsck_hfs -f -y "$tdev" || true
 fsck_hfs -f -n "$tdev"
+done_ok=1
 ls -lsh "$out"

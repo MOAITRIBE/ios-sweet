@@ -1,0 +1,64 @@
+--- a/osfmk/arm64/sleh.c	2026-10-24 03:58:50
++++ b/osfmk/arm64/sleh.c	2026-10-24 03:59:09
+@@ -1353,7 +1353,51 @@
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(SWEET)
++/*
++ * Galaga bring-up: backboardd and SpringBoard sit at one PC in code that only
++ * reads memory (objc header_info::getHeaderInfoRW, dyld MachOFile::forEachSection),
++ * i.e. the same user fault is taken again and again. Report repeats of the same
++ * (thread, address) fault for those two processes: PC, FAR, ESR, fault status,
++ * access type, vm_fault result and the physical page the pmap has for it.
++ */
++#include <string.h>
++extern void *get_bsdtask_info(task_t);
++extern char *proc_name_address(void *p);
++static struct {
++	thread_t th;
++	vm_offset_t addr;
++	uint32_t n;
++} galaga_fault;
++
+ static void
++galaga_trace_fault(arm_saved_state_t *state, uint32_t esr, vm_offset_t addr,
++    fault_status_t fsc, vm_prot_t prot, kern_return_t kr)
++{
++	void *p = get_bsdtask_info(current_task());
++	const char *name = p ? proc_name_address(p) : "";
++	if (strcmp(name, "backboardd") != 0 && strcmp(name, "SpringBoard") != 0) {
++		return;
++	}
++	thread_t th = current_thread();
++	if (galaga_fault.th == th && galaga_fault.addr == addr) {
++		galaga_fault.n++;
++	} else {
++		galaga_fault.th = th;
++		galaga_fault.addr = addr;
++		galaga_fault.n = 1;
++	}
++	uint32_t n = galaga_fault.n;
++	if (n == 3 || n == 100 || n == 10000 || (n % 1000000) == 0) {
++		ppnum_t pn = pmap_find_phys(th->map->pmap, addr);
++		printf("GALAGA FAULT %s pc 0x%llx far 0x%llx esr 0x%x fsc 0x%x prot 0x%x kr %d x%u pa 0x%llx\n",
++		    name, (unsigned long long)get_saved_state_pc(state), (unsigned long long)addr, esr,
++		    (unsigned)fsc, (unsigned)prot, kr, n, (unsigned long long)ptoa_64(pn));
++	}
++}
++#endif
++
++static void
+ handle_user_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_addr,
+     fault_status_t fault_code, vm_prot_t fault_type, expected_fault_handler_t expected_fault_handler)
+ {
+@@ -1405,6 +1449,9 @@
+ 		if (thread->t_rr_state.trr_fault_state != TRR_FAULT_NONE) {
+ 			thread_reset_pcs_done_faulting(thread);
+ 		}
++#if defined(SWEET)
++		galaga_trace_fault(state, esr, vm_fault_addr, fault_code, fault_type, result);
++#endif
+ 		if (result == KERN_SUCCESS || result == KERN_ABORTED) {
+ 			return;
+ 		}

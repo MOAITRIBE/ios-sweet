@@ -1,0 +1,227 @@
+--- a/bsd/dev/galaga_touch.c
++++ b/bsd/dev/galaga_touch.c
+@@ -7,7 +7,7 @@
+  * a polled SPI3 master (spi-mt65xx.c, mt6989 variant) and the FocalTech SPI framing
+  * (focaltech_spi_v2.c). It then polls the IRQ line and hands contacts to
+  * sweet_hid_touch() in panel pixels (1080x2392). Everything it learns is printed
+- * as "GALAGA TOUCH:". Boot-args: galagatouch=0 off, galagatouchdelay=S start late,
++ * as "GALAGA TOUCH:"; the same thread polls the buttons ("GALAGA KEYS:"). Boot-args: galagatouch=0 off, galagatouchdelay=S start late,
+  * galagatouchpoll=1 read every 10 ms whatever the IRQ line says.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -24,6 +24,7 @@
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);
+ void galaga_touch_init(void);
+ 
+ #define GT_TOPCK_PA     0x10000000u     /* mediatek,mt6878-topckgen */
+@@ -68,6 +69,22 @@
+ #define MT6369_VTP_EN           0x1c15  /* bit 0 */
+ #define MT6369_VTP_VOSEL        0x1da5  /* [3:0], 13 = 3.3 V (ldo_volt_table2) */
+ #define MT6369_VTP_3V3          13u
++/*
++ * Buttons. Power and volume up are the MT6363's PWRKEY and HOMEKEY (mt6363keys:
++ * power = KEY_POWER, home = KEY_VOLUMEUP); their debounced levels are in
++ * TOPSTATUS (0x1e, bit 2 is the charger), low while pressed -- bit 0 and bit 1 by
++ * default, galagapwrbit/galagavolupbit move them. Volume down is gpio-keys on GPIO 54,
++ * the side "Essential Key" GPIO 30 (dtbo ai_key), both active low; the latter is
++ * iOS's Home button here.
++ */
++#define MT6363_SID              4u
++#define MT6363_TOPSTATUS        0x1e
++#define GPIO_VOLDOWN            54
++#define GPIO_ESSENTIAL          30
++#define KEY_HID_POWER           0
++#define KEY_HID_VOLUP           1
++#define KEY_HID_VOLDOWN         2
++#define KEY_HID_HOME            3
+ 
+ /* spi-mt65xx.c */
+ #define SPI_CFG1                0x04
+@@ -108,6 +125,9 @@
+ 	bool down[FTS_MAX_POINTS];
+ 	int x[FTS_MAX_POINTS], y[FTS_MAX_POINTS];
+ 	uint8_t tx[128], rx[128];
++	uint32_t pwr_bit, volup_bit;
++	bool key_down[4], key_ok[4];
++	int key_seen[4];
+ } gt;
+ static int gt_sleep_chan;
+ 
+@@ -184,12 +204,12 @@
+ }
+ 
+ static int
+-pmif_read(uint16_t addr, uint8_t *val)
++pmif_read(uint32_t sid, uint16_t addr, uint8_t *val)
+ {
+ 	if (!pmif_wait(PMIF_FSM_IDLE)) {
+ 		return EBUSY;
+ 	}
+-	gt_wr(gt.pmif, PMIF_SWINF_ACC, (PMIF_CMD_EXT_REG_LONG << 30) | (MT6369_SID << 24) | addr);
++	gt_wr(gt.pmif, PMIF_SWINF_ACC, (PMIF_CMD_EXT_REG_LONG << 30) | (sid << 24) | addr);
+ 	if (!pmif_wait(PMIF_FSM_WFVLDCLR)) {
+ 		return ETIMEDOUT;
+ 	}
+@@ -199,14 +219,14 @@
+ }
+ 
+ static int
+-pmif_write(uint16_t addr, uint8_t val)
++pmif_write(uint32_t sid, uint16_t addr, uint8_t val)
+ {
+ 	if (!pmif_wait(PMIF_FSM_IDLE)) {
+ 		return EBUSY;
+ 	}
+ 	gt_wr(gt.pmif, PMIF_SWINF_WDATA, val);
+ 	gt_wr(gt.pmif, PMIF_SWINF_ACC,
+-	    (PMIF_CMD_EXT_REG_LONG << 30) | (1u << 29) | (MT6369_SID << 24) | addr);
++	    (PMIF_CMD_EXT_REG_LONG << 30) | (1u << 29) | (sid << 24) | addr);
+ 	return pmif_wait(PMIF_FSM_IDLE) ? 0 : ETIMEDOUT;
+ }
+ 
+@@ -347,7 +367,50 @@
+ 	}
+ }
+ 
++/* one 20 ms sample per key; a level must repeat once before it counts */
+ static void
++gt_key(int key, bool down)
++{
++	int want = down ? 1 : -1;
++	if (!gt.key_ok[key]) {
++		return;
++	}
++	if (down == gt.key_down[key]) {
++		gt.key_seen[key] = 0;
++		return;
++	}
++	if (gt.key_seen[key] != want) {
++		gt.key_seen[key] = want;
++		return;
++	}
++	gt.key_seen[key] = 0;
++	gt.key_down[key] = down;
++	printf("GALAGA KEYS: %s %s\n", (const char *[]){ "power", "volume up", "volume down", "home" }[key],
++	    down ? "down" : "up");
++	sweet_hid_key(key, down);
++}
++
++static void
++gt_keys_poll(void)
++{
++	static uint8_t last = 0xff;
++	uint8_t top = 0;
++	if (!pmif_read(MT6363_SID, MT6363_TOPSTATUS, &top)) {
++		if (top != last) {
++			static unsigned shown;
++			if (shown++ < 20) {
++				printf("GALAGA KEYS: pmic topstatus 0x%02x\n", top);
++			}
++			last = top;
++		}
++		gt_key(KEY_HID_POWER, !((top >> gt.pwr_bit) & 1));
++		gt_key(KEY_HID_VOLUP, !((top >> gt.volup_bit) & 1));
++	}
++	gt_key(KEY_HID_VOLDOWN, !gpio_get(GPIO_VOLDOWN));
++	gt_key(KEY_HID_HOME, !gpio_get(GPIO_ESSENTIAL));
++}
++
++static void
+ gt_thread(void *arg, wait_result_t result)
+ {
+ 	unsigned delay_s = 0;
+@@ -370,8 +433,8 @@
+ 		goto out;
+ 	}
+ 
+-	err = pmif_read(MT6369_VTP_EN, &en);
+-	err = err ? err : pmif_read(MT6369_VTP_VOSEL, &vosel);
++	err = pmif_read(MT6369_SID, MT6369_VTP_EN, &en);
++	err = err ? err : pmif_read(MT6369_SID, MT6369_VTP_VOSEL, &vosel);
+ 	printf("GALAGA TOUCH: as LK left it: vtp en 0x%x vosel 0x%x (err %d), gpio mode rst %d irq %d dvdd %d spi %d, "
+ 	    "spi3 clk cfg4 0x%x perao 0x%x\n", en, vosel, err, gpio_get_mode(GPIO_RESET), gpio_get_mode(GPIO_IRQ),
+ 	    gpio_get_mode(GPIO_DVDD), gpio_get_mode(GPIO_SPI_FIRST), gt_rd(gt.top, TOP_CLK_CFG_4),
+@@ -386,12 +449,16 @@
+ 	gpio_mode(GPIO_IRQ, 0);
+ 	gpio_input(GPIO_IRQ);
+ 	gpio_mode(GPIO_DVDD, 0);
++	gpio_mode(GPIO_VOLDOWN, 0);
++	gpio_input(GPIO_VOLDOWN);
++	gpio_mode(GPIO_ESSENTIAL, 0);
++	gpio_input(GPIO_ESSENTIAL);
+ 	for (unsigned pin = GPIO_SPI_FIRST; pin < GPIO_SPI_FIRST + 4; pin++) {
+ 		gpio_mode(pin, GPIO_SPI_MODE);
+ 	}
+ 	gt_wait(2);
+-	err = pmif_write(MT6369_VTP_VOSEL, (uint8_t)((vosel & ~0xfu) | MT6369_VTP_3V3));
+-	err = err ? err : pmif_write(MT6369_VTP_EN, en | 1);
++	err = pmif_write(MT6369_SID, MT6369_VTP_VOSEL, (uint8_t)((vosel & ~0xfu) | MT6369_VTP_3V3));
++	err = err ? err : pmif_write(MT6369_SID, MT6369_VTP_EN, en | 1);
+ 	gt_wait(2);
+ 	gpio_out(GPIO_DVDD, true);
+ 	gt_wait(2);
+@@ -403,8 +470,8 @@
+ 	gt_wr(gt.top, TOP_CLK_CFG_UPDATE, TOP_SPI3_UPD);
+ 	gt_wr(gt.perao, PERAO0_CLR, PERAO_SPI3_B);
+ 	gt_wait(200);
+-	(void)pmif_read(MT6369_VTP_EN, &en);
+-	(void)pmif_read(MT6369_VTP_VOSEL, &vosel);
++	(void)pmif_read(MT6369_SID, MT6369_VTP_EN, &en);
++	(void)pmif_read(MT6369_SID, MT6369_VTP_VOSEL, &vosel);
+ 	printf("GALAGA TOUCH: powered: pmic err %d vtp en 0x%x vosel 0x%x, dvdd %d rst %d irq %d, cfg4 0x%x perao 0x%x\n",
+ 	    err, en, vosel, gpio_get(GPIO_DVDD), gpio_get(GPIO_RESET), gpio_get(GPIO_IRQ),
+ 	    gt_rd(gt.top, TOP_CLK_CFG_4), gt_rd(gt.perao, PERAO0_STA));
+@@ -422,17 +489,31 @@
+ 	printf("GALAGA TOUCH: chip id %02x:%02x (FT3683G is 56:72, bootloader 36:b3) fw 0x%x err %d, "
+ 	    "spi status 0x%x/0x%x rx %02x %02x %02x %02x\n", id1, id2, fw, err, gt_rd(gt.spi, SPI_STATUS0),
+ 	    gt_rd(gt.spi, SPI_STATUS1), gt.rx[0], gt.rx[1], gt.rx[2], gt.rx[3]);
+-	if (err || id1 != 0x56 || id2 != 0x72) {
+-		printf("GALAGA TOUCH: no FT3683G; stopping\n");
+-		goto out;
++	bool touch = !err && id1 == 0x56 && id2 == 0x72;
++	if (touch) {
++		printf("GALAGA TOUCH: FT3683G ready, 1080x2392, poll 10 ms (%s)\n", gt.poll ? "always" : "on IRQ low");
++	} else {
++		printf("GALAGA TOUCH: no FT3683G; buttons only\n");
+ 	}
+-
+-	printf("GALAGA TOUCH: FT3683G ready, 1080x2392, poll 10 ms (%s)\n", gt.poll ? "always" : "on IRQ low");
++	/* a button that reads pressed now is floating or mis-assigned: leave it out */
++	uint8_t top = 0;
++	int perr = pmif_read(MT6363_SID, MT6363_TOPSTATUS, &top);
++	gt.key_ok[KEY_HID_POWER] = !perr && ((top >> gt.pwr_bit) & 1);
++	gt.key_ok[KEY_HID_VOLUP] = !perr && ((top >> gt.volup_bit) & 1);
++	gt.key_ok[KEY_HID_VOLDOWN] = gpio_get(GPIO_VOLDOWN) == 1;
++	gt.key_ok[KEY_HID_HOME] = gpio_get(GPIO_ESSENTIAL) == 1;
++	printf("GALAGA KEYS: pmic topstatus 0x%02x (err %d), power bit %u %s, volume up bit %u %s, "
++	    "volume down gpio %d %s, essential gpio %d %s\n", top, perr,
++	    gt.pwr_bit, gt.key_ok[KEY_HID_POWER] ? "ok" : "off", gt.volup_bit, gt.key_ok[KEY_HID_VOLUP] ? "ok" : "off",
++	    GPIO_VOLDOWN, gt.key_ok[KEY_HID_VOLDOWN] ? "ok" : "off", GPIO_ESSENTIAL, gt.key_ok[KEY_HID_HOME] ? "ok" : "off");
+ 	uint8_t buf[FTS_TOUCH_LEN];
+ 	unsigned errors = 0, ticks = 0;
+ 	bool any = false;
+ 	for (;;) {
+-		if (gt.poll || any || !gpio_get(GPIO_IRQ) || (++ticks % 10u) == 0) {
++		if ((++ticks & 1u) == 0) {
++			gt_keys_poll();
++		}
++		if (touch && (gt.poll || any || !gpio_get(GPIO_IRQ) || (ticks % 10u) == 0)) {
+ 			err = fts_read(FTS_REG_POINTS, buf, sizeof(buf));
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+@@ -464,6 +545,12 @@
+ 	gt.started = true;
+ 	(void)PE_parse_boot_argn("galagatouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("galagatouchpoll", &poll, sizeof(poll));
++	gt.pwr_bit = 0;
++	gt.volup_bit = 1;
++	(void)PE_parse_boot_argn("galagapwrbit", &gt.pwr_bit, sizeof(gt.pwr_bit));
++	(void)PE_parse_boot_argn("galagavolupbit", &gt.volup_bit, sizeof(gt.volup_bit));
++	gt.pwr_bit &= 7;
++	gt.volup_bit &= 7;
+ 	gt.poll = poll == 1;
+ 	if (!enabled) {
+ 		printf("GALAGA TOUCH: disabled (galagatouch=0)\n");

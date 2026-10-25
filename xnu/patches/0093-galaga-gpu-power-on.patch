@@ -1,0 +1,163 @@
+--- a/bsd/dev/galaga_gpu_probe.c
++++ b/bsd/dev/galaga_gpu_probe.c
+@@ -9,6 +9,12 @@
+  * written, and nothing under 0x13Cx is read unless SPM reports MFG0 powered and
+  * acknowledged: an unpowered block can hang the bus. Every value is printed as
+  * "GALAGA GPU:". Boot-arg galagagpuprobe=0 skips it.
++ *
++ * Then, if the shim found GPUEB's shared memory in LK's device tree (boot-args
++ * galagagpuebmem=/galagagpuebsize=), power the GPU on the way gpufreq_v2.c does:
++ * CMD_INIT_SHARED_MEM and CMD_POWER_CONTROL(on) over mailbox 0, pin IPI_ID_GPUFREQ
++ * (send slots 4-11, reply slots 58-65, bit 1), and read Mali GPU_ID only if GPUEB
++ * reports the GPU powered. galagagpupower=0 stops after the read-only part.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -37,6 +43,28 @@
+ #define GPUEB_PC                0x071c
+ #define GPUEB_MBOX_TX_STS       0x2000
+ #define GPUEB_MBOX_RX_STS       0x2078
++#define GPUEB_MBOX_SET          0x2004
++#define GPUEB_MBOX_CLR          0x2074
++#define GPUEB_MBOX_TX_SLOTS     (0x3d80 + 4 * 4)        /* 0x13c3fd90, in the GPR page mapping */
++#define GPUEB_MBOX_RX_SLOTS     (0x3d80 + 58 * 4)       /* 0x13c3fe68 */
++#define GPUEB_PIN_GPUFREQ       (1u << 1)
++#define CMD_INIT_SHARED_MEM     0
++#define CMD_POWER_CONTROL       6
++#define GPUFREQ_MEM_SIZE        0x4000
++#define BABADADA                0xbabadadau
++/* gpufreq_mt6878.h shared status offsets */
++#define ST_POWER_COUNT          0x1c
++#define ST_MTCMOS_COUNT         0x24
++#define ST_CUR_FGPU             0x44
++#define ST_CUR_VGPU             0x5c
++#define ST_POWER_CONTROL        0xc4
++#define ST_SHADER_PRESENT       0xd0
++#define ST_MFG_PWR_STATUS       0x10c
++#define MALI_PA                 0x13000000u
++#define MALI_GPU_ID             0x000
++#define MALI_SHADER_PRESENT_LO  0x100
++#define KERNEL_RAM_LO           0x140000000ull  /* our xnu's RAM (shim: 0x1_4000_0000..0x2_3dc0_0000) */
++#define KERNEL_RAM_HI           0x23dc00000ull
+ 
+ static inline uint32_t
+ gp_rd(vm_offset_t base, uint32_t off)
+@@ -44,6 +72,111 @@
+ 	return *(volatile uint32_t *)(base + off);
+ }
+ 
++static inline void
++gp_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++/* mtk-gpueb-mailbox / mtk_ipi_send_compl(IPI_SEND_POLLING): 8 words out, 8 words back */
++static int
++gpueb_call(vm_offset_t gpr, vm_offset_t reg, const uint32_t msg[8], uint32_t reply[8])
++{
++	int i;
++	for (i = 0; i < 100000 && (gp_rd(reg, GPUEB_MBOX_TX_STS) & GPUEB_PIN_GPUFREQ); i++) {
++		delay(1);
++	}
++	if (i == 100000) {
++		return EBUSY;
++	}
++	for (int w = 0; w < 8; w++) {
++		gp_wr(gpr, GPUEB_MBOX_TX_SLOTS + 4 * w, msg[w]);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gp_wr(reg, GPUEB_MBOX_SET, GPUEB_PIN_GPUFREQ);
++	for (i = 0; i < 2000000 && !(gp_rd(reg, GPUEB_MBOX_RX_STS) & GPUEB_PIN_GPUFREQ); i++) {
++		delay(1);
++	}
++	if (i == 2000000) {
++		return ETIMEDOUT;
++	}
++	for (int w = 0; w < 8; w++) {
++		reply[w] = gp_rd(gpr, GPUEB_MBOX_RX_SLOTS + 4 * w);
++	}
++	gp_wr(reg, GPUEB_MBOX_CLR, GPUEB_PIN_GPUFREQ);
++	return 0;
++}
++
++static void
++gpu_power_on(vm_offset_t gpr, vm_offset_t reg, uint32_t magic)
++{
++	uint64_t base = 0, size = 0;
++	uint32_t want = 1, msg[8], reply[8];
++	(void)PE_parse_boot_argn("galagagpupower", &want, sizeof(want));
++	if (!want) {
++		return;
++	}
++	if (!PE_parse_boot_argn("galagagpuebmem", &base, sizeof(base)) ||
++	    !PE_parse_boot_argn("galagagpuebsize", &size, sizeof(size))) {
++		printf("GALAGA GPU: no GPUEB shared memory from the shim; GPU left off\n");
++		return;
++	}
++	printf("GALAGA GPU: gpueb shared memory 0x%llx size 0x%llx\n", base, size);
++	if (!magic || size < GPUFREQ_MEM_SIZE || (base & 0x3fff) ||
++	    (base + GPUFREQ_MEM_SIZE > KERNEL_RAM_LO && base < KERNEL_RAM_HI)) {
++		printf("GALAGA GPU: unusable (magic 0x%x, inside our RAM or misaligned); GPU left off\n", magic);
++		return;
++	}
++	vm_offset_t shm = ml_io_map((vm_offset_t)base, GPUFREQ_MEM_SIZE);
++	if (!shm) {
++		printf("GALAGA GPU: shared memory mapping failed\n");
++		return;
++	}
++	for (uint32_t off = 0; off < GPUFREQ_MEM_SIZE; off += 4) {
++		gp_wr(shm, off, 0);
++	}
++	gp_wr(gpr, GPUEB_GPR_OFF + 4 * GPUEB_GPR_MAGIC, 0);    /* gpufreq_gpueb_init() takes the magic */
++
++	bzero(msg, sizeof(msg));
++	msg[0] = magic;
++	msg[1] = CMD_INIT_SHARED_MEM;
++	msg[4] = (uint32_t)base;
++	msg[5] = (uint32_t)(base >> 32);
++	msg[6] = GPUFREQ_MEM_SIZE;
++	int err = gpueb_call(gpr, reg, msg, reply);
++	delay(10000);
++	printf("GALAGA GPU: INIT_SHARED_MEM -> %d, reply cmd %u ret %d, shared[0] 0x%08x %s\n", err, reply[1],
++	    (int)reply[4], gp_rd(shm, 0), gp_rd(shm, 0) == BABADADA ? "(GPUEB answered)" : "(no answer)");
++	if (err) {
++		return;
++	}
++
++	bzero(msg, sizeof(msg));
++	msg[0] = magic;
++	msg[1] = CMD_POWER_CONTROL;
++	msg[4] = 1;
++	err = gpueb_call(gpr, reg, msg, reply);
++	delay(10000);
++	int ret = (int)reply[4];
++	uint32_t count = gp_rd(shm, ST_POWER_COUNT);
++	printf("GALAGA GPU: POWER_CONTROL(on) -> %d, ret %d; power count %u mtcmos %u fgpu %u kHz vgpu %u0 uV "
++	    "power_control %u shader_present 0x%x mfg 0x%x\n", err, ret, count, gp_rd(shm, ST_MTCMOS_COUNT),
++	    gp_rd(shm, ST_CUR_FGPU), gp_rd(shm, ST_CUR_VGPU), gp_rd(shm, ST_POWER_CONTROL),
++	    gp_rd(shm, ST_SHADER_PRESENT), gp_rd(shm, ST_MFG_PWR_STATUS));
++	if (err || ret < 0 || count == 0) {
++		printf("GALAGA GPU: GPU not reported on; Mali left untouched\n");
++		return;
++	}
++	vm_offset_t mali = ml_io_map(MALI_PA, 0x4000);
++	if (!mali) {
++		return;
++	}
++	uint32_t id = gp_rd(mali, MALI_GPU_ID);
++	printf("GALAGA GPU: Mali GPU_ID 0x%08x (arch %u.%u, product 0x%x, rev %u.%u) shader_present 0x%x\n", id,
++	    id >> 28, (id >> 24) & 0xf, (id >> 16) & 0xff, (id >> 12) & 0xf, (id >> 4) & 0xff,
++	    gp_rd(mali, MALI_SHADER_PRESENT_LO));
++}
++
+ void
+ galaga_gpu_probe(void)
+ {
+@@ -93,5 +226,6 @@
+ 	    pc0, pc1, pc2, (pc0 != pc1 || pc1 != pc2) ? "running" : "not moving",
+ 	    gp_rd(reg, GPUEB_MBOX_TX_STS), gp_rd(reg, GPUEB_MBOX_RX_STS),
+ 	    (gp_rd(reg, GPUEB_MBOX_TX_STS) >> 1) & 1, (gp_rd(reg, GPUEB_MBOX_RX_STS) >> 1) & 1);
++	gpu_power_on(gpr, reg, g[GPUEB_GPR_MAGIC]);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

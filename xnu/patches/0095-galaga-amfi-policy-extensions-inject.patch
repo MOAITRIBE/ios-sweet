@@ -1,0 +1,171 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -305,8 +305,57 @@
+ 	}
+ }
+ 
++/*
++ * __mac_syscall("AMFI", op, arg) reaches a policy by name, so this one is
++ * registered as "AMFI" (it was "SWEET AMFI", and every such call failed with
++ * ENOPOLICY). Two operations matter (as in HackiOS's kern_minimac.c):
++ *   0x5a  dyld's "check dyld policy" { flags in, pointer to flags out }:
++ *         everything allowed, DYLD_INSERT_LIBRARIES included (galagainject).
++ *   0x60  libamfi's "query boot-arg state": without one of the bits 0x86
++ *         ExtensionKit wants /System/Library/xpc/extensions.plist.sig checked
++ *         by AMFI's IOKit service, which does not exist here; the table of
++ *         extension points is then never read, LaunchServices refuses every
++ *         app extension and no poster (wallpaper) or widget extension runs.
++ *         Nothing is enforced by this kernel, so that is what it says.
++ * The first use of each operation number is logged.
++ */
++#define SWEET_AMFI_CHECK_DYLD_POLICY    0x5a
++#define SWEET_AMFI_DYLD_ALLOW_ALL       0xffULL
++#define SWEET_AMFI_QUERY_BOOTARG_STATE  0x60
++#define SWEET_AMFI_NOT_ENFORCING        0x86ULL
++static uint64_t sweet_amfi_seen[2];
++
++static int
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	if (call >= 0 && call < 128 && !(sweet_amfi_seen[call / 64] & (1ULL << (call % 64)))) {
++		sweet_amfi_seen[call / 64] |= 1ULL << (call % 64);
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET AMFI: %s op 0x%x\n", name, call);
++	}
++	if (call == SWEET_AMFI_QUERY_BOOTARG_STATE) {
++		uint64_t state = SWEET_AMFI_NOT_ENFORCING;
++		return copyout(&state, arg, sizeof(state));
++	}
++	if (call == SWEET_AMFI_CHECK_DYLD_POLICY) {
++		struct {
++			uint64_t input_flags;
++			user_addr_t output_flags;
++		} args;
++		uint64_t flags = SWEET_AMFI_DYLD_ALLOW_ALL;
++		int error = copyin(arg, &args, sizeof(args));
++		if (error == 0) {
++			error = copyout(&flags, args.output_flags, sizeof(flags));
++		}
++		return error;
++	}
++	return ENOPOLICY;
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -360,7 +409,7 @@
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5601,11 +5601,76 @@
+  *
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Galaga: boot-arg galagainject=LIBRARY@NAME,NAME[;LIBRARY@NAME...] starts
++ * every program whose file name is one of the NAMEs with
++ * DYLD_INSERT_LIBRARIES=LIBRARY (several libraries for one program are
++ * joined with ":"), the way HackiOS's kern.exec_inject does. launchd will not
++ * pass DYLD_ variables from a job, and dyld honours this one because the
++ * "AMFI" policy allows it (sweet_amfi.c, op 0x5a).
+  */
++static char galaga_inject_conf[256];
++static int galaga_inject_parsed;
++
++static bool
++galaga_inject_env(struct image_params *imgp, char *env, size_t size)
++{
++	if (!galaga_inject_parsed) {
++		if (!PE_parse_boot_argn("galagainject", galaga_inject_conf, sizeof(galaga_inject_conf))) {
++			galaga_inject_conf[0] = 0;
++		}
++		galaga_inject_parsed = 1;
++	}
++	if (galaga_inject_conf[0] == 0 || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	const char *name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	size_t namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
++	size_t used = strlcpy(env, "DYLD_INSERT_LIBRARIES=", size);
++	bool any = false;
++	const char *p = galaga_inject_conf;
++	while (*p != 0) {
++		const char *library = p;
++		while (*p != 0 && *p != '@' && *p != ';') {
++			p++;
++		}
++		size_t liblen = (size_t)(p - library);
++		bool matched = false;
++		while (*p == '@' || *p == ',') {
++			const char *word = ++p;
++			while (*p != 0 && *p != ',' && *p != ';') {
++				p++;
++			}
++			if ((size_t)(p - word) == namelen && namelen != 0 && strncmp(word, name, namelen) == 0) {
++				matched = true;
++			}
++		}
++		if (matched && liblen != 0 && used + 1 + liblen < size) {
++			if (any) {
++				env[used++] = ':';
++			}
++			memcpy(env + used, library, liblen);
++			used += liblen;
++			env[used] = 0;
++			any = true;
++		}
++		if (*p == ';') {
++			p++;
++		}
++	}
++	return any;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	char            galaga_env[300];
++#endif
+ 	int error = 0;
+ 	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
+ 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
+@@ -5775,6 +5840,22 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* one more variable for the programs named in galagainject */
++	if (galaga_inject_env(imgp, galaga_env, sizeof(galaga_env))) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(galaga_env), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;

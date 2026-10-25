@@ -1,0 +1,40 @@
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -2318,7 +2318,16 @@
+ 	wsave = thread_interrupt_level(THREAD_UNINT);
+ 	kr = exception_triage_thread(EXC_CORPSE_NOTIFY, code, EXCEPTION_CODE_MAX, thread);
+ 	if (kr != KERN_SUCCESS) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* no ReportCrash here: at least say whose corpse it was and why */
++		extern void proc_name(int pid, char *buf, int size);
++		char sweet_name[64] = "?";
++		proc_name(task_pid(corpse), sweet_name, sizeof(sweet_name));
++		printf("Failed to send exception EXC_CORPSE_NOTIFY. error code: %d for pid %d (%s, exception %d code 0x%llx)\n",
++		    kr, task_pid(corpse), sweet_name, etype, (unsigned long long)subcode);
++#else
+ 		printf("Failed to send exception EXC_CORPSE_NOTIFY. error code: %d for pid %d\n", kr, task_pid(corpse));
++#endif
+ 	}
+ 
+ 	(void)thread_interrupt_level(wsave);
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1485,6 +1485,18 @@
+ 	}
+ #endif
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* Galaga bring-up: anything that dies with an error in its first 30 s (extensions) */
++	if (rv && strcmp(p->p_comm, "xpcproxy") != 0) {
++		static int sweet_early_exits;
++		struct timeval now;
++		microtime(&now);
++		if (now.tv_sec - p->p_start.tv_sec < 30 && sweet_early_exits++ < 150) {
++			char *desc = exit_reason ? exit_reason_get_string_desc(exit_reason) : NULL;
++			printf("EXIT %s[%d] status 0x%x after %lds reason %u/0x%llx: %s\n", p->p_comm, proc_getpid(p), rv,
++			    (long)(now.tv_sec - p->p_start.tv_sec), exit_reason ? exit_reason->osr_namespace : 0,
++			    exit_reason ? (unsigned long long)exit_reason->osr_code : 0ULL, desc != NULL ? desc : "(none)");
++		}
++	}
+ 	/* Galaga bring-up: an app launch that dies in xpcproxy (before the app's exec) */
+ 	if (rv && strcmp(p->p_comm, "xpcproxy") == 0) {
+ 		static int sweet_xpcproxy_exits;

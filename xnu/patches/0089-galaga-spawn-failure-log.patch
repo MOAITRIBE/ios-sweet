@@ -1,0 +1,48 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -4220,7 +4220,23 @@
+ 	}
+ 
+ bad:
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * Galaga bring-up: apps never start (xpcproxy runs, the app's "exec" line never
++	 * comes). Say who failed to spawn what, with the errno and exec failure reason.
++	 */
++	if (error != 0) {
++		static int sweet_spawn_failures;
++		if (sweet_spawn_failures++ < 200) {
++			printf("SPAWN FAIL %s[%d] %.160s err %d reason %u/0x%llx\n", ap->p_name, proc_getpid(ap),
++			    imgp->ip_strings ? imgp->ip_strings : "?", error,
++			    exec_failure_reason ? exec_failure_reason->osr_namespace : 0,
++			    exec_failure_reason ? (unsigned long long)exec_failure_reason->osr_code : 0ULL);
++		}
++	}
++#endif
+ 
++
+ 	if (error == 0) {
+ 		/* reset delay idle sleep status if set */
+ #if CONFIG_DELAY_IDLE_SLEEP
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1484,6 +1484,19 @@
+ 		    __FUNCTION__, p->p_comm, proc_getpid(p), rv);
+ 	}
+ #endif
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* Galaga bring-up: an app launch that dies in xpcproxy (before the app's exec) */
++	if (rv && strcmp(p->p_comm, "xpcproxy") == 0) {
++		static int sweet_xpcproxy_exits;
++		if (sweet_xpcproxy_exits++ < 100) {
++			char *desc = exit_reason ? exit_reason_get_string_desc(exit_reason) : NULL;
++			printf("EXIT xpcproxy[%d] status 0x%x reason %u/0x%llx: %s\n", proc_getpid(p), rv,
++			    exit_reason ? exit_reason->osr_namespace : 0,
++			    exit_reason ? (unsigned long long)exit_reason->osr_code : 0ULL,
++			    desc != NULL ? desc : "(none)");
++		}
++	}
++#endif
+ 
+ 	/*
+ 	 * If a thread in this task has already

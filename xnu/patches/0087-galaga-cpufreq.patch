@@ -1,0 +1,143 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/galaga_touch.c			standard
++bsd/dev/galaga_cpufreq.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void galaga_touch_init(void);
++extern void galaga_cpufreq_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -958,6 +959,7 @@
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
++	galaga_cpufreq_init();
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	galaga_touch_init();
+--- /dev/null
++++ b/bsd/dev/galaga_cpufreq.c
+@@ -0,0 +1,111 @@
++/*
++ * Galaga (CMF Phone, MediaTek MT6878): CPU clocks to the top of their tables.
++ *
++ * LK leaves both clusters at a modest operating point and expects the OS to ask
++ * for more. The MCUPM firmware does the switching (PLL, voltage, SVS); the OS only
++ * picks a row, through the two "performance-domain" windows of
++ * mediatek,cpufreq-hw (performance-controller@11bc00: A55 cpu0-3, A78 cpu4-7), the
++ * way mediatek-cpufreq-hw_main.c does: read the 32-row table, set ENABLE, wait for
++ * HW_STATE, write the row's index -- or its frequency in kHz when the firmware runs
++ * in frequency-scaling mode (CSRAM 0x4cc non-zero). No thermal governor runs here.
++ * Boot-args: galagacpufreq=0 leaves LK's clocks, galagacpumhz=N caps both clusters.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void galaga_cpufreq_init(void);
++
++#define CSRAM_PA                0x0011bc00u
++#define CSRAM_MAP_PA            0x00118000u     /* 16 KiB page holding CSRAM_PA */
++#define CSRAM_FREQ_SCALING      0x4cc
++#define DOMAIN0_OFF             0x010           /* performance-domain0, A55 */
++#define DOMAIN1_OFF             0x130           /* performance-domain1, A78 */
++#define REG_FREQ_LUT_TABLE      0x00
++#define REG_FREQ_ENABLE         0x84
++#define REG_FREQ_PERF_STATE     0x88
++#define REG_FREQ_HW_STATE       0x8c
++#define LUT_MAX_ENTRIES         32
++#define LUT_FREQ_MHZ(v)         ((v) & 0xfffu)
++#define CPUFREQ_HW_STATUS       (1u << 0)
++
++static inline uint32_t
++cf_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++cf_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++static void
++cf_domain(vm_offset_t csram, uint32_t off, const char *name, uint32_t cap_mhz, bool by_freq)
++{
++	vm_offset_t d = csram + off;
++	uint32_t best = 0, best_mhz = 0, lo_mhz = ~0u, n = 0, prev = ~0u;
++
++	/* mtk_cpu_create_freq_table(): rows until a frequency repeats */
++	for (uint32_t i = 0; i < LUT_MAX_ENTRIES; i++) {
++		uint32_t mhz = LUT_FREQ_MHZ(cf_rd(d, REG_FREQ_LUT_TABLE + 4 * i));
++		if (mhz == prev) {
++			break;
++		}
++		prev = mhz;
++		n++;
++		lo_mhz = MIN(lo_mhz, mhz);
++		if (mhz > best_mhz && (!cap_mhz || mhz <= cap_mhz)) {
++			best_mhz = mhz;
++			best = i;
++		}
++	}
++	uint32_t before = cf_rd(d, REG_FREQ_PERF_STATE);
++	if (!n || !best_mhz) {
++		printf("GALAGA CPUFREQ: %s: no usable table (rows %u, perf state 0x%x)\n", name, n, before);
++		return;
++	}
++	cf_wr(d, REG_FREQ_ENABLE, 1);
++	uint32_t hw = 0;
++	for (int i = 0; i < 300 && !((hw = cf_rd(d, REG_FREQ_HW_STATE)) & CPUFREQ_HW_STATUS); i++) {
++		delay(1000);
++	}
++	if (!(hw & CPUFREQ_HW_STATUS)) {
++		printf("GALAGA CPUFREQ: %s: hardware not enabled (hw state 0x%x); clocks left as LK set them\n",
++		    name, hw);
++		return;
++	}
++	cf_wr(d, REG_FREQ_PERF_STATE, by_freq ? best_mhz * 1000 : best);
++	delay(1000);
++	printf("GALAGA CPUFREQ: %s: %u rows %u-%u MHz, perf state 0x%x -> row %u (%u MHz), hw state 0x%x\n",
++	    name, n, lo_mhz, best_mhz, before, best, best_mhz, cf_rd(d, REG_FREQ_HW_STATE));
++}
++
++void
++galaga_cpufreq_init(void)
++{
++	uint32_t enabled = 1, cap_mhz = 0;
++
++	(void)PE_parse_boot_argn("galagacpufreq", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("galagacpumhz", &cap_mhz, sizeof(cap_mhz));
++	if (!enabled) {
++		printf("GALAGA CPUFREQ: disabled (galagacpufreq=0)\n");
++		return;
++	}
++	vm_offset_t page = ml_io_map(CSRAM_MAP_PA, 0x8000);
++	vm_offset_t csram = page + (CSRAM_PA - CSRAM_MAP_PA);
++	if (!page) {
++		printf("GALAGA CPUFREQ: CSRAM mapping failed\n");
++		return;
++	}
++	bool by_freq = cf_rd(csram, CSRAM_FREQ_SCALING) != 0;
++	printf("GALAGA CPUFREQ: firmware takes %s\n", by_freq ? "frequencies (kHz)" : "table rows");
++	cf_domain(csram, DOMAIN0_OFF, "A55 cpu0-3", cap_mhz, by_freq);
++	cf_domain(csram, DOMAIN1_OFF, "A78 cpu4-7", cap_mhz, by_freq);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

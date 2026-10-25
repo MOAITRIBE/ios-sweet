@@ -1,0 +1,128 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/galaga_touch.c			standard
+ bsd/dev/galaga_cpufreq.c			standard
++bsd/dev/galaga_gpu_probe.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@
+ extern void sweet_touch_init(void);
+ extern void galaga_touch_init(void);
+ extern void galaga_cpufreq_init(void);
++extern void galaga_gpu_probe(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -960,6 +961,7 @@
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	galaga_cpufreq_init();
++	galaga_gpu_probe();
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	galaga_touch_init();
+--- /dev/null
++++ b/bsd/dev/galaga_gpu_probe.c
+@@ -0,0 +1,97 @@
++/*
++ * Galaga (CMF Phone, MediaTek MT6878): read-only look at the GPU's power controller.
++ *
++ * The Mali GPU is powered by GPUEB, a MediaTek microcontroller started by LK, which
++ * takes commands over a mailbox (gpufreq_v2.c, mtk-gpueb-mailbox.c). Before sending
++ * it anything, find out whether it runs: the SPM power state of the MFG0 domain it
++ * sits in, its IPI magic (GPR13, non-zero once its firmware is up), its program
++ * counter (moving = running) and the GPUFREQ mailbox status bits. Nothing is
++ * written, and nothing under 0x13Cx is read unless SPM reports MFG0 powered and
++ * acknowledged: an unpowered block can hang the bus. Every value is printed as
++ * "GALAGA GPU:". Boot-arg galagagpuprobe=0 skips it.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void galaga_gpu_probe(void);
++
++/* SPM (16 KiB page at 0x1c000000) */
++#define SPM_PAGE_PA             0x1c000000u
++#define SPM_PWR_STATUS_A        0x1410          /* 0x1c001410 */
++#define SPM_MFG0_PWR_CON        0x1eb4          /* 0x1c001eb4, bits 31:30 = power ack */
++#define SPM_PWR_STATUS_B        0x1f50          /* 0x1c001f50, bit 1 = MFG0 */
++#define SPM_MFG0_ACK            (3u << 30)
++/* GPUEB SRAM GPRs (page 0x13c3c000): gpueb_gpr_base 0x13c3fd1c */
++#define GPUEB_GPR_PAGE_PA       0x13c3c000u
++#define GPUEB_GPR_OFF           0x3d1c
++#define GPUEB_GPR_COUNT         25
++#define GPUEB_GPR_MAGIC         13
++/* GPUEB registers (page 0x13c60000): PC 0x13c6071c, mailbox 0 TX/RX status */
++#define GPUEB_REG_PAGE_PA       0x13c60000u
++#define GPUEB_PC                0x071c
++#define GPUEB_MBOX_TX_STS       0x2000
++#define GPUEB_MBOX_RX_STS       0x2078
++
++static inline uint32_t
++gp_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++void
++galaga_gpu_probe(void)
++{
++	uint32_t enabled = 1;
++
++	(void)PE_parse_boot_argn("galagagpuprobe", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("GALAGA GPU: probe disabled (galagagpuprobe=0)\n");
++		return;
++	}
++	vm_offset_t spm = ml_io_map(SPM_PAGE_PA, 0x4000);
++	if (!spm) {
++		printf("GALAGA GPU: SPM mapping failed\n");
++		return;
++	}
++	uint32_t con = gp_rd(spm, SPM_MFG0_PWR_CON);
++	uint32_t sta_a = gp_rd(spm, SPM_PWR_STATUS_A), sta_b = gp_rd(spm, SPM_PWR_STATUS_B);
++	printf("GALAGA GPU: spm mfg0 pwr_con 0x%08x (ack %u), pwr status 0x%08x / 0x%08x (mfg0 bit %u)\n",
++	    con, (con >> 30) & 3, sta_a, sta_b, (sta_b >> 1) & 1);
++	if ((con & SPM_MFG0_ACK) != SPM_MFG0_ACK) {
++		printf("GALAGA GPU: MFG0 not acknowledged on; GPUEB left untouched\n");
++		return;
++	}
++
++	vm_offset_t gpr = ml_io_map(GPUEB_GPR_PAGE_PA, 0x4000);
++	vm_offset_t reg = ml_io_map(GPUEB_REG_PAGE_PA, 0x4000);
++	if (!gpr || !reg) {
++		printf("GALAGA GPU: GPUEB mapping failed\n");
++		return;
++	}
++	uint32_t g[GPUEB_GPR_COUNT];
++	for (int i = 0; i < GPUEB_GPR_COUNT; i++) {
++		g[i] = gp_rd(gpr, GPUEB_GPR_OFF + 4 * i);
++	}
++	printf("GALAGA GPU: gpueb magic (gpr13) 0x%08x %s\n", g[GPUEB_GPR_MAGIC],
++	    g[GPUEB_GPR_MAGIC] ? "(firmware up)" : "(zero: firmware not up, or already taken)");
++	for (int i = 0; i < GPUEB_GPR_COUNT; i += 5) {
++		printf("GALAGA GPU: gpr%02d-%02d %08x %08x %08x %08x %08x\n", i, i + 4,
++		    g[i], g[i + 1], g[i + 2], g[i + 3], g[i + 4]);
++	}
++	uint32_t pc0 = gp_rd(reg, GPUEB_PC);
++	delay(1000);
++	uint32_t pc1 = gp_rd(reg, GPUEB_PC);
++	delay(1000);
++	uint32_t pc2 = gp_rd(reg, GPUEB_PC);
++	printf("GALAGA GPU: gpueb pc 0x%08x 0x%08x 0x%08x (%s), mbox tx 0x%08x rx 0x%08x (gpufreq bit %u/%u)\n",
++	    pc0, pc1, pc2, (pc0 != pc1 || pc1 != pc2) ? "running" : "not moving",
++	    gp_rd(reg, GPUEB_MBOX_TX_STS), gp_rd(reg, GPUEB_MBOX_RX_STS),
++	    (gp_rd(reg, GPUEB_MBOX_TX_STS) >> 1) & 1, (gp_rd(reg, GPUEB_MBOX_RX_STS) >> 1) & 1);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

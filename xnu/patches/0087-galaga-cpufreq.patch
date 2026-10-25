@@ -29,7 +29,7 @@
  	galaga_touch_init();
 --- /dev/null
 +++ b/bsd/dev/galaga_cpufreq.c
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,112 @@
 +/*
 + * Galaga (CMF Phone, MediaTek MT6878): CPU clocks to the top of their tables.
 + *
@@ -46,6 +46,7 @@
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/errno.h>
++#include <kern/clock.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +

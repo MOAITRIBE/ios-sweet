@@ -1,0 +1,496 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@
+ bsd/dev/galaga_touch.c			standard
+ bsd/dev/galaga_cpufreq.c			standard
+ bsd/dev/galaga_gpu_probe.c			standard
++bsd/dev/galaga_mali.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/galaga_gpu_probe.c
++++ b/bsd/dev/galaga_gpu_probe.c
+@@ -15,6 +15,7 @@
+  * CMD_INIT_SHARED_MEM and CMD_POWER_CONTROL(on) over mailbox 0, pin IPI_ID_GPUFREQ
+  * (send slots 4-11, reply slots 58-65, bit 1), and read Mali GPU_ID only if GPUEB
+  * reports the GPU powered. galagagpupower=0 stops after the read-only part.
++ * With a Mali v11+ GPU_ID, galaga_mali.c then boots the CSF firmware.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -26,6 +27,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void galaga_gpu_probe(void);
++extern void galaga_mali_boot(vm_offset_t mali);
+ 
+ /* SPM (16 KiB page at 0x1c000000) */
+ #define SPM_PAGE_PA             0x1c000000u
+@@ -175,6 +177,9 @@
+ 	printf("GALAGA GPU: Mali GPU_ID 0x%08x (arch %u.%u, product 0x%x, rev %u.%u) shader_present 0x%x\n", id,
+ 	    id >> 28, (id >> 24) & 0xf, (id >> 16) & 0xff, (id >> 12) & 0xf, (id >> 4) & 0xff,
+ 	    gp_rd(mali, MALI_SHADER_PRESENT_LO));
++	if ((id >> 28) >= 11 && id != 0xffffffffu) {
++		galaga_mali_boot(mali);
++	}
+ }
+ 
+ void
+--- /dev/null
++++ b/bsd/dev/galaga_mali.c
+@@ -0,0 +1,455 @@
++/*
++ * Galaga (CMF Phone, MediaTek MT6878): boot the Mali-G615's CSF firmware.
++ *
++ * Runs once GPUEB has powered the GPU (galaga_gpu_probe.c). Follows Linux panthor
++ * (panthor_gpu.c, panthor_mmu.c, panthor_fw.c) without interrupts: soft reset, no
++ * coherency (the stock DT has no dma-coherent), L2 on, then load mali_csffw.bin's
++ * IFACE sections into contiguous memory, map them at their MCU addresses in an
++ * AArch64 4K page table (same descriptors and MEMATTR as io-pgtable ARM_64_LPAE_S1)
++ * on address space 0, start the MCU (MCU_CONTROL AUTO) and wait for JOB_INT GLB_IF.
++ * Then read the global interface from the shared section at MCU VA 0x04000000 and
++ * send one GLB_PING through doorbell 0.
++ *
++ * The firmware is proprietary, so it is not in this tree: mkpayload.py --blob
++ * MaliFirmware=mali_csffw.bin puts it after the kernel and adds
++ * /chosen/memory-map MaliFirmware = <phys, size>. Every value is printed as
++ * "GALAGA MALI:". Boot-arg galagamali=0 skips it.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_static_ptovirt(vm_offset_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++void galaga_mali_boot(vm_offset_t mali);
++
++/* GPU_CONTROL */
++#define GPU_L2_FEATURES         0x004
++#define GPU_MMU_FEATURES        0x014
++#define GPU_AS_PRESENT          0x018
++#define GPU_CSF_ID              0x01c
++#define GPU_INT_RAWSTAT         0x020
++#define GPU_INT_CLEAR           0x024
++#define GPU_INT_MASK            0x028
++#define GPU_CMD                 0x030
++#define GPU_STATUS              0x034
++#define GPU_FAULT_STATUS        0x03c
++#define GPU_FAULT_ADDR          0x040
++#define GPU_L2_PRESENT          0x120
++#define GPU_L2_READY            0x160
++#define GPU_L2_PWRON            0x1a0
++#define GPU_L2_PWRTRANS         0x220
++#define GPU_COHERENCY_FEATURES  0x300
++#define GPU_COHERENCY_PROTOCOL  0x304
++#define GPU_IRQ_RESET_COMPLETED (1u << 8)
++#define GPU_SOFT_RESET          0x101
++#define GPU_COHERENCY_NONE      31
++/* MCU_CONTROL, JOB_INT, MMU */
++#define MCU_CONTROL             0x700
++#define MCU_STATUS              0x704
++#define MCU_CONTROL_AUTO        2
++#define JOB_INT_RAWSTAT         0x1000
++#define JOB_INT_CLEAR           0x1004
++#define JOB_INT_MASK            0x1008
++#define JOB_INT_GLOBAL_IF       (1u << 31)
++#define MMU_INT_RAWSTAT         0x2000
++#define MMU_INT_CLEAR           0x2004
++#define MMU_INT_MASK            0x2008
++#define AS0_TRANSTAB            0x2400
++#define AS0_MEMATTR             0x2408
++#define AS0_COMMAND             0x2418
++#define AS0_FAULTSTATUS         0x241c
++#define AS0_FAULTADDRESS        0x2420
++#define AS0_STATUS              0x2428
++#define AS0_TRANSCFG            0x2430
++#define AS_COMMAND_UPDATE       1
++#define AS_STATUS_ACTIVE        1u
++#define MALI_DOORBELL0_PA       0x13080000u     /* CSF_DOORBELL(0) = GPU + 0x80000 */
++/* AS_TRANSCFG: ADRMODE_AARCH64_4K | INA_BITS(55 - va_bits) | PTW_MEMATTR_WB | PTW_RA */
++#define TRANSCFG(va_bits)       (6ull | ((uint64_t)(55 - (va_bits)) << 6) | (2ull << 24) | (1ull << 30))
++/*
++ * mair_to_memattr(io-pgtable LPAE S1 MAIR 0xf404ff44, non-coherent): idx 0 NC 0x4c,
++ * idx 1 WB r/w-alloc 0x8f, idx 2 (device) NC 0x4c, idx 3 WB no-alloc 0x8c, rest NC.
++ */
++#define MEMATTR                 0x4c4c4c4c8c4c8f4cull
++/* io-pgtable ARM_64_LPAE_S1 descriptors (4K granule) */
++#define PTE_VALID_TABLE         3ull
++#define PTE_PAGE                3ull
++#define PTE_IDX_NC              (0ull << 2)
++#define PTE_IDX_CACHE           (1ull << 2)
++#define PTE_AP_UNPRIV           (1ull << 6)
++#define PTE_AP_RDONLY           (1ull << 7)
++#define PTE_SH_OS               (2ull << 8)
++#define PTE_SH_IS               (3ull << 8)
++#define PTE_AF                  (1ull << 10)
++#define PTE_NG                  (1ull << 11)
++#define PTE_XN                  (3ull << 53)
++#define PTE_ADDR                0x0000fffffffff000ull
++#define GPU_PAGE                0x1000u
++/* mali_csffw.bin (panthor_fw.c) */
++#define FW_MAGIC                0xc3f13a6eu
++#define FW_ENTRY_IFACE          0
++#define FW_IFACE_RD             (1u << 0)
++#define FW_IFACE_WR             (1u << 1)
++#define FW_IFACE_EX             (1u << 2)
++#define FW_IFACE_CACHE_MODE(f)  (((f) >> 3) & 3)
++#define FW_CACHE_MODE_CACHED    1
++#define FW_IFACE_PROT           (1u << 5)
++#define FW_IFACE_SHARED         (1u << 30)
++#define FW_IFACE_ZERO           (1u << 31)
++#define MCU_SHARED_VA           0x04000000u
++#define GLB_PING                (1u << 8)
++/* Page tables + the non-protected sections (704 KiB less the 256 KiB protected one) */
++#define MALI_MEM_SIZE           0x100000u
++
++static struct {
++	vm_offset_t mali, mem;
++	uint64_t mem_pa;
++	uint32_t used;
++	uint64_t *l0;
++	vm_offset_t shared;             /* CPU address of the MCU shared section */
++	uint64_t shared_pa;
++	uint32_t shared_size;
++} gm;
++
++static inline uint32_t
++m_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(gm.mali + off);
++}
++
++static inline void
++m_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(gm.mali + off) = v;
++}
++
++static inline void
++m_wr64(uint32_t off, uint64_t v)
++{
++	m_wr(off, (uint32_t)v);
++	m_wr(off + 4, (uint32_t)(v >> 32));
++}
++
++/* Poll until (reg & mask) == want, up to timeout_us; returns the microseconds taken or -1. */
++static int
++m_poll(uint32_t off, uint32_t mask, uint32_t want, int timeout_us)
++{
++	for (int us = 0; us <= timeout_us; us += 10) {
++		if ((m_rd(off) & mask) == want) {
++			return us;
++		}
++		delay(10);
++	}
++	return -1;
++}
++
++/* GPU pages from the contiguous block (already zeroed); 0 when it is full. */
++static uint32_t
++m_alloc(uint32_t size)
++{
++	size = (size + GPU_PAGE - 1) & ~(GPU_PAGE - 1);
++	if (gm.used + size > MALI_MEM_SIZE) {
++		return 0;
++	}
++	uint32_t off = gm.used;
++	gm.used += size;
++	return off;
++}
++
++static uint64_t *
++m_table(uint64_t *tbl, unsigned idx)
++{
++	if (!(tbl[idx] & 1)) {
++		uint32_t off = m_alloc(GPU_PAGE);
++		if (!off) {
++			return NULL;
++		}
++		tbl[idx] = (gm.mem_pa + off) | PTE_VALID_TABLE;
++	}
++	return (uint64_t *)(gm.mem + ((tbl[idx] & PTE_ADDR) - gm.mem_pa));
++}
++
++static int
++m_map_page(uint64_t va, uint64_t pa, uint64_t attrs)
++{
++	uint64_t *l1 = m_table(gm.l0, (va >> 39) & 511);
++	uint64_t *l2 = l1 ? m_table(l1, (va >> 30) & 511) : NULL;
++	uint64_t *l3 = l2 ? m_table(l2, (va >> 21) & 511) : NULL;
++	if (!l3) {
++		return -1;
++	}
++	l3[(va >> 12) & 511] = (pa & PTE_ADDR) | attrs;
++	return 0;
++}
++
++/* panthor_vm_map_pages() prot -> arm_lpae_prot_to_pte() */
++static uint64_t
++m_attrs(uint32_t flags)
++{
++	uint64_t a = PTE_PAGE | PTE_AF | PTE_NG | PTE_AP_UNPRIV;
++	if (!(flags & FW_IFACE_WR)) {
++		a |= PTE_AP_RDONLY;
++	}
++	if (!(flags & FW_IFACE_EX)) {
++		a |= PTE_XN;
++	}
++	if (FW_IFACE_CACHE_MODE(flags) == FW_CACHE_MODE_CACHED) {
++		a |= PTE_IDX_CACHE | PTE_SH_IS;
++	} else {
++		a |= PTE_IDX_NC | PTE_SH_OS;
++	}
++	return a;
++}
++
++/* panthor_fw_load(): copy and map every IFACE section; returns the number mapped or -1. */
++static int
++m_load_fw(const uint8_t *fw, uint32_t fw_size)
++{
++	const uint32_t *h = (const uint32_t *)fw;
++	if (fw_size < 20 || h[0] != FW_MAGIC || ((h[1] >> 8) & 0xff) != 0 || h[4] > fw_size) {
++		printf("GALAGA MALI: bad firmware header magic 0x%08x version %u.%u size 0x%x\n",
++		    h[0], (h[1] >> 8) & 0xff, h[1] & 0xff, fw_size >= 20 ? h[4] : 0);
++		return -1;
++	}
++	printf("GALAGA MALI: firmware version %u.%u hash 0x%08x, %u header bytes, %u bytes\n",
++	    (h[1] >> 8) & 0xff, h[1] & 0xff, h[2], h[4], fw_size);
++	int mapped = 0;
++	for (uint32_t off = 20; off + 4 <= h[4];) {
++		uint32_t ehdr = *(const uint32_t *)(fw + off), size = (ehdr >> 8) & 0xff;
++		if (size < 4 || off + size > h[4]) {
++			printf("GALAGA MALI: bad entry 0x%08x at 0x%x\n", ehdr, off);
++			return -1;
++		}
++		if ((ehdr & 0xff) == FW_ENTRY_IFACE && size >= 24) {
++			const uint32_t *e = (const uint32_t *)(fw + off + 4);
++			uint32_t flags = e[0], va = e[1], va_end = e[2], ds = e[3], de = e[4];
++			uint32_t len = va_end - va;
++			if (flags & FW_IFACE_PROT) {
++				printf("GALAGA MALI: section 0x%08x-0x%08x protected, skipped (as panthor)\n", va, va_end);
++			} else if (va_end > va && (va & (GPU_PAGE - 1)) == 0 && de >= ds && de <= fw_size && de - ds <= len) {
++				uint32_t moff = m_alloc(len);
++				if (!moff) {
++					printf("GALAGA MALI: out of section memory at 0x%08x\n", va);
++					return -1;
++				}
++				memcpy((void *)(gm.mem + moff), fw + ds, de - ds);
++				uint64_t attrs = m_attrs(flags);
++				for (uint32_t p = 0; p < len; p += GPU_PAGE) {
++					if (m_map_page(va + p, gm.mem_pa + moff + p, attrs)) {
++						printf("GALAGA MALI: out of page-table memory at 0x%08x\n", va + p);
++						return -1;
++					}
++				}
++				if (va == MCU_SHARED_VA) {
++					gm.shared = gm.mem + moff;
++					gm.shared_pa = gm.mem_pa + moff;
++					gm.shared_size = len;
++				}
++				printf("GALAGA MALI: section 0x%08x-0x%08x %c%c%c cache %u%s%s data 0x%x -> pa 0x%llx\n", va, va_end,
++				    (flags & FW_IFACE_RD) ? 'r' : '-', (flags & FW_IFACE_WR) ? 'w' : '-',
++				    (flags & FW_IFACE_EX) ? 'x' : '-', FW_IFACE_CACHE_MODE(flags),
++				    (flags & FW_IFACE_SHARED) ? " shared" : "", (flags & FW_IFACE_ZERO) ? " zero" : "",
++				    de - ds, gm.mem_pa + moff);
++				mapped++;
++			} else {
++				printf("GALAGA MALI: bad section flags 0x%08x va 0x%08x-0x%08x data 0x%x-0x%x\n",
++				    flags, va, va_end, ds, de);
++				return -1;
++			}
++		}
++		off += size;
++	}
++	return mapped;
++}
++
++static void
++m_faults(const char *when)
++{
++	printf("GALAGA MALI: %s: mcu status %u, gpu status 0x%x int 0x%08x fault 0x%08x@0x%08x, job int 0x%08x, "
++	    "mmu int 0x%08x as0 status 0x%x fault 0x%08x@0x%08x%08x\n", when, m_rd(MCU_STATUS), m_rd(GPU_STATUS),
++	    m_rd(GPU_INT_RAWSTAT), m_rd(GPU_FAULT_STATUS), m_rd(GPU_FAULT_ADDR), m_rd(JOB_INT_RAWSTAT),
++	    m_rd(MMU_INT_RAWSTAT), m_rd(AS0_STATUS), m_rd(AS0_FAULTSTATUS), m_rd(AS0_FAULTADDRESS + 4),
++	    m_rd(AS0_FAULTADDRESS));
++}
++
++/* The MCU writes the shared section uncached: drop any CPU copy before reading. */
++static uint32_t
++m_shared_rd(uint32_t va)
++{
++	uint32_t off = va - MCU_SHARED_VA;
++	flush_dcache64((addr64_t)(gm.shared_pa + (off & ~63u)), 64, TRUE);
++	return *(volatile uint32_t *)(gm.shared + off);
++}
++
++static void
++m_shared_wr(uint32_t va, uint32_t v)
++{
++	uint32_t off = va - MCU_SHARED_VA;
++	*(volatile uint32_t *)(gm.shared + off) = v;
++	flush_dcache64((addr64_t)(gm.shared_pa + (off & ~63u)), 64, TRUE);
++}
++
++static bool
++m_in_shared(uint32_t va, uint32_t len)
++{
++	return va >= MCU_SHARED_VA && va + len <= MCU_SHARED_VA + gm.shared_size && !(va & 3);
++}
++
++/* panthor_fw_init_ifaces() (read only) and one GLB_PING (panthor_fw_ping_work). */
++static void
++m_glb_iface(void)
++{
++	uint32_t c[8];
++	for (int i = 0; i < 8; i++) {
++		c[i] = m_shared_rd(MCU_SHARED_VA + 4 * i);
++	}
++	printf("GALAGA MALI: glb iface version %u.%u.%u features 0x%x input 0x%08x output 0x%08x groups %u stride 0x%x "
++	    "perfcnt 0x%x instr 0x%x\n", c[0] >> 24, (c[0] >> 16) & 0xff, c[0] & 0xffff, c[1], c[2], c[3], c[4], c[5],
++	    c[6], c[7]);
++	if (!c[0] || !m_in_shared(c[2], 64) || !m_in_shared(c[3], 64)) {
++		printf("GALAGA MALI: no usable global interface (firmware did not boot?)\n");
++		return;
++	}
++	vm_offset_t db = ml_io_map(MALI_DOORBELL0_PA, 0x4000);
++	if (!db) {
++		return;
++	}
++	uint32_t req = m_shared_rd(c[2]), ack = m_shared_rd(c[3]);
++	uint32_t want = (req & ~GLB_PING) | ((ack ^ GLB_PING) & GLB_PING);
++	m_shared_wr(c[2], want);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)db = 1;
++	int us;
++	for (us = 0; us < 100000; us += 100) {
++		ack = m_shared_rd(c[3]);
++		if (!((ack ^ want) & GLB_PING)) {
++			break;
++		}
++		delay(100);
++	}
++	printf("GALAGA MALI: GLB_PING req 0x%08x ack 0x%08x -> %s after %d us\n", want, ack,
++	    ((ack ^ want) & GLB_PING) ? "NO ANSWER" : "answered", us);
++}
++
++void
++galaga_mali_boot(vm_offset_t mali)
++{
++	uint32_t enabled = 1;
++	(void)PE_parse_boot_argn("galagamali", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("GALAGA MALI: disabled (galagamali=0)\n");
++		return;
++	}
++	gm.mali = mali;
++
++	/* the firmware, from the payload (mkpayload.py --blob MaliFirmware=...) */
++	DTEntry mmap;
++	const uint64_t *loc = NULL;
++	unsigned int loc_size = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mmap) != kSuccess ||
++	    SecureDTGetProperty(mmap, "MaliFirmware", (void const **)&loc, &loc_size) != kSuccess || loc_size < 16) {
++		printf("GALAGA MALI: no MaliFirmware in /chosen/memory-map; MCU not started\n");
++		return;
++	}
++	const uint8_t *fw = (const uint8_t *)ml_static_ptovirt((vm_offset_t)loc[0]);
++	uint32_t fw_size = (uint32_t)loc[1];
++	printf("GALAGA MALI: firmware at pa 0x%llx (%u bytes in the payload)\n", loc[0], fw_size);
++
++	uint32_t mmu = m_rd(GPU_MMU_FEATURES), va_bits = mmu & 0xff;
++	printf("GALAGA MALI: l2 features 0x%08x mmu features 0x%x (va %u pa %u bits) as present 0x%x csf id 0x%08x "
++	    "l2 present 0x%x coherency features 0x%x\n", m_rd(GPU_L2_FEATURES), mmu, va_bits, (mmu >> 8) & 0xff,
++	    m_rd(GPU_AS_PRESENT), m_rd(GPU_CSF_ID), m_rd(GPU_L2_PRESENT), m_rd(GPU_COHERENCY_FEATURES));
++	if (va_bits < 40 || va_bits > 48 || !(m_rd(GPU_AS_PRESENT) & 1)) {
++		printf("GALAGA MALI: unexpected MMU (needs a 4-level table and AS0); MCU not started\n");
++		return;
++	}
++	m_faults("before reset");
++
++	/* panthor_gpu_soft_reset(), polled */
++	m_wr(GPU_INT_MASK, 0);
++	m_wr(JOB_INT_MASK, 0);
++	m_wr(MMU_INT_MASK, 0);
++	m_wr(GPU_INT_CLEAR, ~0u);
++	m_wr(GPU_CMD, GPU_SOFT_RESET);
++	int us = m_poll(GPU_INT_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 100000);
++	printf("GALAGA MALI: soft reset %s (%d us), gpu int 0x%08x\n", us < 0 ? "TIMEOUT" : "done", us,
++	    m_rd(GPU_INT_RAWSTAT));
++	if (us < 0) {
++		return;
++	}
++	m_wr(GPU_INT_CLEAR, ~0u);
++	m_wr(JOB_INT_CLEAR, ~0u);
++	m_wr(MMU_INT_CLEAR, ~0u);
++
++	/* panthor_gpu_l2_power_on(): coherency first, then L2 */
++	m_wr(GPU_COHERENCY_PROTOCOL, GPU_COHERENCY_NONE);
++	if (m_poll(GPU_L2_PWRTRANS, 1, 0, 20000) < 0) {
++		printf("GALAGA MALI: L2 stuck in a power transition\n");
++		return;
++	}
++	m_wr64(GPU_L2_PWRON, 1);
++	us = m_poll(GPU_L2_READY, 1, 1, 20000);
++	printf("GALAGA MALI: L2 power on %s (%d us), ready 0x%x\n", us < 0 ? "TIMEOUT" : "done", us, m_rd(GPU_L2_READY));
++	if (us < 0) {
++		return;
++	}
++
++	/* memory for the page tables and the sections, never freed */
++	if (kmem_alloc_contig(kernel_map, &gm.mem, MALI_MEM_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("GALAGA MALI: no contiguous memory\n");
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)gm.mem);
++	if (!pn) {
++		return;
++	}
++	gm.mem_pa = ptoa_64(pn);
++	gm.used = GPU_PAGE;                     /* offset 0 = the level-0 table */
++	gm.l0 = (uint64_t *)gm.mem;
++
++	int n = m_load_fw(fw, fw_size);
++	if (n <= 0 || !gm.shared) {
++		printf("GALAGA MALI: firmware not loaded (%d sections, shared %s); MCU not started\n", n,
++		    gm.shared ? "found" : "missing");
++		return;
++	}
++	flush_dcache64((addr64_t)gm.mem_pa, MALI_MEM_SIZE, TRUE);
++	printf("GALAGA MALI: %d sections mapped, %u KiB used of the block at pa 0x%llx\n", n, gm.used / 1024, gm.mem_pa);
++
++	/* panthor_mmu_as_enable(AS0) */
++	if (m_poll(AS0_STATUS, AS_STATUS_ACTIVE, 0, 100000) < 0) {
++		printf("GALAGA MALI: AS0 busy before update\n");
++		return;
++	}
++	m_wr64(AS0_TRANSTAB, gm.mem_pa);
++	m_wr64(AS0_MEMATTR, MEMATTR);
++	m_wr64(AS0_TRANSCFG, TRANSCFG(va_bits));
++	m_wr(AS0_COMMAND, AS_COMMAND_UPDATE);
++	us = m_poll(AS0_STATUS, AS_STATUS_ACTIVE, 0, 100000);
++	printf("GALAGA MALI: AS0 transtab 0x%llx memattr 0x%llx transcfg 0x%llx -> update %s (%d us)\n", gm.mem_pa,
++	    MEMATTR, TRANSCFG(va_bits), us < 0 ? "TIMEOUT" : "done", us);
++	if (us < 0) {
++		return;
++	}
++
++	/* panthor_fw_start(), polled */
++	m_wr(JOB_INT_CLEAR, ~0u);
++	m_wr(MCU_CONTROL, MCU_CONTROL_AUTO);
++	us = m_poll(JOB_INT_RAWSTAT, JOB_INT_GLOBAL_IF, JOB_INT_GLOBAL_IF, 1000000);
++	printf("GALAGA MALI: MCU %s (%d us)\n", us < 0 ? "DID NOT BOOT" : "booted, GLB_IF raised", us);
++	m_faults("after MCU start");
++	m_wr(JOB_INT_CLEAR, JOB_INT_GLOBAL_IF);
++	m_glb_iface();
++	m_faults("end");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

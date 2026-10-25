@@ -1,0 +1,159 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -488,7 +488,133 @@
+ 	return ENXIO;
+ }
+ 
++/*
++ * DME_LINKSTARTUP leaves the link in its slowest mode (PWM-G1: a few Mbit/s), and
++ * every page iOS faults in then crawls through it. sweet's ABL hands over a link
++ * already in HS; LK switches the host off, so after our link startup switch it the
++ * way ufshcd.c (ufshcd_get_max_pwr_mode, ufshcd_change_power_mode) and
++ * ufs-mediatek.c (ufs_mtk_pre_pwr_change) do: the highest HS gear both ends
++ * support, rate B, all connected lanes, by way of FASTAUTO HS-G1 for G4 and up,
++ * falling back a gear at a time. Boot-args: ufshs=0 stays in PWM, ufsgear=N caps
++ * the gear.
++ */
++#define UIC_DME_PEER_GET        0x03
++#define IS_UPMS                 (1u << 4)
++#define HCS_UPMCRS(hcs)         (((hcs) >> 8) & 7)
++#define PWR_LOCAL               1
++#define PA_ACTIVETXDATALANES    0x1560
++#define PA_CONNECTEDTXDATALANES 0x1561
++#define PA_TXGEAR               0x1568
++#define PA_TXTERMINATION        0x1569
++#define PA_HSSERIES             0x156a
++#define PA_PWRMODE              0x1571
++#define PA_ACTIVERXDATALANES    0x1580
++#define PA_CONNECTEDRXDATALANES 0x1581
++#define PA_RXGEAR               0x1583
++#define PA_RXTERMINATION        0x1584
++#define PA_MAXRXHSGEAR          0x1587
++#define PA_PWRMODEUSERDATA0     0x15b0
++#define PA_TXHSADAPTTYPE        0x15d4
++#define DME_LOCALFC0PROTECTIONTIMEOUTVAL 0xd041
++#define FAST_MODE               1
++#define FASTAUTO_MODE           4
++#define PA_HS_MODE_B            2
++#define PA_INITIAL_ADAPT        1
++#define PA_NO_ADAPT             3
++
++static bool galaga_brought_up;
++
+ static int
++ufs_dme_set(uint32_t attr, uint32_t val)
++{
++	return ufs_uic(UIC_DME_SET, attr << 16, val, NULL);
++}
++
++static uint32_t
++ufs_dme_get(uint32_t cmd, uint32_t attr)
++{
++	uint32_t v = 0;
++	return ufs_uic(cmd, attr << 16, 0, &v) ? 0 : v;
++}
++
++/* ufshcd_uic_change_pwr_mode(): the DME_SET completes first, the mode change after it (UPMS) */
++static int
++ufs_change_pwr_mode(uint32_t rx_tx)
++{
++	ufs_wr(REG_IS, IS_UPMS);
++	int err = ufs_dme_set(PA_PWRMODE, rx_tx);
++	if (err) {
++		return err;
++	}
++	for (int i = 0; i < 50000 && !(ufs_rd(REG_IS) & IS_UPMS); i++) {
++		delay(10);
++	}
++	uint32_t is = ufs_rd(REG_IS), status = HCS_UPMCRS(ufs_rd(REG_HCS));
++	ufs_wr(REG_IS, IS_UPMS);
++	if (!(is & IS_UPMS)) {
++		return ETIMEDOUT;
++	}
++	return status == PWR_LOCAL ? 0 : EIO;
++}
++
++static int
++ufs_set_hs(uint32_t mode, uint32_t gear, uint32_t lanes_rx, uint32_t lanes_tx)
++{
++	(void)ufs_dme_set(PA_RXGEAR, gear);
++	(void)ufs_dme_set(PA_ACTIVERXDATALANES, lanes_rx);
++	(void)ufs_dme_set(PA_RXTERMINATION, 1);
++	(void)ufs_dme_set(PA_TXGEAR, gear);
++	(void)ufs_dme_set(PA_ACTIVETXDATALANES, lanes_tx);
++	(void)ufs_dme_set(PA_TXTERMINATION, 1);
++	(void)ufs_dme_set(PA_HSSERIES, PA_HS_MODE_B);
++	/* ufshcd_dme_configure_adapt(): gears below 4 take no adapt */
++	(void)ufs_dme_set(PA_TXHSADAPTTYPE, mode == FAST_MODE && gear >= 4 ? PA_INITIAL_ADAPT : PA_NO_ADAPT);
++	return ufs_change_pwr_mode(mode << 4 | mode);
++}
++
++static void
++ufs_galaga_hs(void)
++{
++	/* ufshcd_change_power_mode(): the DL timeouts it hands over with every change */
++	static const uint32_t userdata[6] = { 8191, 65535, 32767, 8191, 65535, 32767 };
++	uint32_t want = 1, cap = 5;
++
++	PE_parse_boot_argn("ufshs", &want, sizeof(want));
++	PE_parse_boot_argn("ufsgear", &cap, sizeof(cap));
++	uint32_t lanes_rx = ufs_dme_get(UIC_DME_GET, PA_CONNECTEDRXDATALANES);
++	uint32_t lanes_tx = ufs_dme_get(UIC_DME_GET, PA_CONNECTEDTXDATALANES);
++	uint32_t max_rx = ufs_dme_get(UIC_DME_GET, PA_MAXRXHSGEAR);        /* what the host receives */
++	uint32_t max_tx = ufs_dme_get(UIC_DME_PEER_GET, PA_MAXRXHSGEAR);   /* what the device receives */
++	printf("GALAGA UFS: link mode 0x%x gear %u, lanes %u/%u, max HS gear %u/%u\n",
++	    ufs_dme_get(UIC_DME_GET, PA_PWRMODE), ufs_dme_get(UIC_DME_GET, PA_RXGEAR), lanes_rx, lanes_tx,
++	    max_rx, max_tx);
++	if (want != 1 || !lanes_rx || !lanes_tx || !max_rx || !max_tx) {
++		return;
++	}
++	for (int i = 0; i < 6; i++) {
++		(void)ufs_dme_set(PA_PWRMODEUSERDATA0 + i, userdata[i]);
++	}
++	for (int i = 0; i < 3; i++) {
++		(void)ufs_dme_set(DME_LOCALFC0PROTECTIONTIMEOUTVAL + i, userdata[i]);
++	}
++
++	int err = EINVAL;
++	for (uint32_t gear = MIN(MIN(max_rx, max_tx), cap); gear >= 1 && err; gear--) {
++		/* ufs_mtk_pmc_via_fastauto(): G4 and up go through FASTAUTO HS-G1 first */
++		if (gear >= 4) {
++			int fa = ufs_set_hs(FASTAUTO_MODE, 1, lanes_rx, lanes_tx);
++			printf("GALAGA UFS: FASTAUTO HS-G1 -> %d\n", fa);
++		}
++		err = ufs_set_hs(FAST_MODE, gear, lanes_rx, lanes_tx);
++		printf("GALAGA UFS: FAST HS-G%u rate B x%u -> %d\n", gear, lanes_rx, err);
++	}
++	printf("GALAGA UFS: link now mode 0x%x gear rx %u tx %u lanes %u/%u\n",
++	    ufs_dme_get(UIC_DME_GET, PA_PWRMODE), ufs_dme_get(UIC_DME_GET, PA_RXGEAR),
++	    ufs_dme_get(UIC_DME_GET, PA_TXGEAR), ufs_dme_get(UIC_DME_GET, PA_ACTIVERXDATALANES),
++	    ufs_dme_get(UIC_DME_GET, PA_ACTIVETXDATALANES));
++}
++
++static int
+ ufs_take_over_host(void)
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+@@ -498,6 +624,7 @@
+ 		if (err) {
+ 			return err;
+ 		}
++		galaga_brought_up = true;
+ 		hce = ufs_rd(REG_HCE);
+ 		hcs = ufs_rd(REG_HCS);
+ 	}
+@@ -788,6 +915,14 @@
+ 			}
+ 		}
+ 		error = found;
++		/* only now, with the device known to answer in PWM: then make sure it still does */
++		if (!error && galaga_brought_up) {
++			static const uint8_t tur[6] = { 0x00 };
++			ufs_galaga_hs();
++			for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			}
++			printf("GALAGA UFS: test-unit-ready after the mode change -> %d\n", error);
++		}
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {

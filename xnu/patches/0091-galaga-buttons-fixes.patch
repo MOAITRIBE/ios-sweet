@@ -1,0 +1,52 @@
+--- a/bsd/dev/galaga_touch.c
++++ b/bsd/dev/galaga_touch.c
+@@ -72,11 +72,17 @@
+ /*
+  * Buttons. Power and volume up are the MT6363's PWRKEY and HOMEKEY (mt6363keys:
+  * power = KEY_POWER, home = KEY_VOLUMEUP); their debounced levels are in
+- * TOPSTATUS (0x1e, bit 2 is the charger), low while pressed -- bit 0 and bit 1 by
+- * default, galagapwrbit/galagavolupbit move them. Volume down is gpio-keys on GPIO 54,
++ * TOPSTATUS (0x1e, bit 2 is the charger), low while pressed -- power is bit 1 and
++ * volume up bit 0 (tested on the phone), galagapwrbit/galagavolupbit move them. Volume down is gpio-keys on GPIO 54,
+  * the side "Essential Key" GPIO 30 (dtbo ai_key), both active low; the latter is
+- * iOS's Home button here.
++ * iOS's Home button here. Both pins want the pull-up Android's pinctrl gives them
++ * (key-default, ai_key_default); LK sets it for volume down only.
+  */
++#define IOCFG_BR_PA             0x11d40000u     /* GPIO 54: bit 15 */
++#define IOCFG_LM_PA             0x11e20000u     /* GPIO 30: bit 12 */
++#define IOCFG_IES               0x70
++#define IOCFG_PD                0xa0
++#define IOCFG_PU                0xb0
+ #define MT6363_SID              4u
+ #define MT6363_TOPSTATUS        0x1e
+ #define GPIO_VOLDOWN            54
+@@ -453,6 +459,17 @@
+ 	gpio_input(GPIO_VOLDOWN);
+ 	gpio_mode(GPIO_ESSENTIAL, 0);
+ 	gpio_input(GPIO_ESSENTIAL);
++	/* pinctrl-mt6878.c ies/pd/pu ranges: input enable, no pull-down, pull-up */
++	static const struct { uint32_t pa, bit; } pulls[] = { { IOCFG_BR_PA, 15 }, { IOCFG_LM_PA, 12 } };
++	for (unsigned i = 0; i < sizeof(pulls) / sizeof(pulls[0]); i++) {
++		vm_offset_t io = ml_io_map(pulls[i].pa, 0x1000);
++		uint32_t b = 1u << pulls[i].bit;
++		if (io) {
++			gt_wr(io, IOCFG_IES, gt_rd(io, IOCFG_IES) | b);
++			gt_wr(io, IOCFG_PD, gt_rd(io, IOCFG_PD) & ~b);
++			gt_wr(io, IOCFG_PU, gt_rd(io, IOCFG_PU) | b);
++		}
++	}
+ 	for (unsigned pin = GPIO_SPI_FIRST; pin < GPIO_SPI_FIRST + 4; pin++) {
+ 		gpio_mode(pin, GPIO_SPI_MODE);
+ 	}
+@@ -545,8 +562,8 @@
+ 	gt.started = true;
+ 	(void)PE_parse_boot_argn("galagatouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("galagatouchpoll", &poll, sizeof(poll));
+-	gt.pwr_bit = 0;
+-	gt.volup_bit = 1;
++	gt.pwr_bit = 1;
++	gt.volup_bit = 0;
+ 	(void)PE_parse_boot_argn("galagapwrbit", &gt.pwr_bit, sizeof(gt.pwr_bit));
+ 	(void)PE_parse_boot_argn("galagavolupbit", &gt.volup_bit, sizeof(gt.volup_bit));
+ 	gt.pwr_bit &= 7;
